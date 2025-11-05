@@ -4,9 +4,8 @@
 # Works for NBA, NFL, MLB now; safe to extend to NCAAM/NCAAF later.
 
 from __future__ import annotations
-import os, time, json, typing as t
+import os, time, typing as t
 import requests
-from datetime import datetime
 
 # -----------------------------
 # Config
@@ -48,7 +47,7 @@ NATIONAL_NETWORKS = {
     "NFL Network", "NFLN",
     "NBA TV", "NBATV",
     "B/R Sports", "Bleacher Report",
-    # Conference nets (you said to treat + as national; we follow ESPN flag first)
+    # Conference nets (you asked to treat "+" as national; we follow ESPN flag first)
     "SEC Network", "SEC Network+", "SECN", "SECN+",
     "Big Ten Network", "BTN",
     "ACC Network", "ACCN",
@@ -88,7 +87,6 @@ def _scoreboard_urls(sport_key: str, date_iso: str) -> list[str]:
     ]
 
     # Attach date param on ones that accept it
-    # ESPN generally likes yyyymmdd while we pass yyyy-mm-dd; most endpoints accept either.
     yyyymmdd = date_iso.replace("-", "")
     urls_with_params = []
     for u in urls:
@@ -119,10 +117,8 @@ def _is_national_from_comp(comp: dict) -> tuple[bool, str | None]:
                 else:
                     short = b.get("shortName") or b.get("station")
                 return True, (short or "").strip() or None
-            # If not explicitly national, still collect a network string
         # No explicit national flag, try to extract a recognizable network
         for b in broadcasts:
-            # ESPN varies fields; grab any useful
             short = b.get("shortName") or b.get("station") or b.get("name")
             if isinstance(short, list) and short:
                 short = short[0]
@@ -138,7 +134,7 @@ def _parse_event(e: dict, league_key: str) -> dict | None:
     """
     Normalize an ESPN event from scoreboard into our schema.
     Expected output keys:
-      sport, road, home, network, neutral_site, event_name, event_id, comp_id
+      sport, road, home, network, neutral_site, event_name, event_id, comp_id, completed
     """
     try:
         competitions = e.get("competitions") or []
@@ -190,16 +186,13 @@ def _parse_event(e: dict, league_key: str) -> dict | None:
 
 def _looks_final_like(ev: dict) -> bool:
     """
-    Conservative 'final-like' check: explicitly completed or status unavailable but time is 0.
-    We already mark 'completed' above; use that and allow a tiny grace window.
+    Conservative 'final-like' check: explicitly completed.
     """
-    if ev.get("completed"):
-        return True
-    return False
+    return bool(ev.get("completed"))
 
 def list_final_events_for_date(date_iso: str, leagues: list[str]) -> list[dict]:
     """
-    Return normalized events for leagues that look 'final-like' on date.
+    Return normalized events for leagues that look 'final-like' on date (YYYY-MM-DD).
     """
     out: list[dict] = []
 
@@ -219,13 +212,10 @@ def list_final_events_for_date(date_iso: str, leagues: list[str]) -> list[dict]:
 
         # Scoreboard shape variants: 'events' (site API) or 'items' (core API chain)
         events = data.get("events") or data.get("items") or []
-        # Core API sometimes returns links; if so, we’re done for tonight
         if isinstance(events, dict):
-            # Unexpected shape
             events = []
 
-        found = 0
-        finals = 0
+        found = finals = 0
         for e in events:
             found += 1
             ev = _parse_event(e, league)
@@ -242,68 +232,85 @@ def list_final_events_for_date(date_iso: str, leagues: list[str]) -> list[dict]:
     return out
 
 # -----------------------------
+# Public helpers expected by main.py
+# -----------------------------
+
+def _to_iso(date_str: str) -> str:
+    """Accept 'YYYYMMDD' or 'YYYY-MM-DD'; return 'YYYY-MM-DD'."""
+    s = date_str.strip()
+    if len(s) == 8 and s.isdigit():
+        return f"{s[0:4]}-{s[4:6]}-{s[6:8]}"
+    return s
+
+def get_final_like_events(sport_lower: str, date_str: str) -> list[dict]:
+    """
+    main.py calls this. It returns a list of dicts shaped for posting:
+      { id, competition_id, away, home, broadcast }
+    """
+    sport_up = sport_lower.upper()
+    iso = _to_iso(date_str)
+    # Ask only for this sport to keep things light
+    raw = list_final_events_for_date(iso, [sport_up])
+
+    out: list[dict] = []
+    for ev in raw:
+        # Map to the shape main.py expects
+        out.append({
+            "id": ev["event_id"],
+            "competition_id": ev["comp_id"],
+            "away": ev["road"],
+            "home": ev["home"],
+            "broadcast": ev["network"],  # None or short name
+        })
+    return out
+
+# -----------------------------
 # Win probability fetch
 # -----------------------------
 def _summary_urls(league_key: str, event_id: str) -> list[str]:
     sport, league = LEAGUE_PATH[league_key]
     # Try summary first, then pbp
     return [
-        f"https://site.web.api.espn.com/apis/v2/sports/{sport}/{league}/summary",
-        f"https://site.api.espn.com/apis/site/v2/sports/{sport}/{league}/summary",
-        f"https://site.web.api.espn.com/apis/v2/sports/{sport}/{league}/playbyplay",
-        f"https://site.api.espn.com/apis/site/v2/sports/{sport}/{league}/playbyplay",
+        f"https://site.web.api.espn.com/apis/v2/sports/{sport}/{league}/summary?event={event_id}",
+        f"https://site.api.espn.com/apis/site/v2/sports/{sport}/{league}/summary?event={event_id}",
+        f"https://site.web.api.espn.com/apis/v2/sports/{sport}/{league}/playbyplay?event={event_id}",
+        f"https://site.api.espn.com/apis/site/v2/sports/{sport}/{league}/playbyplay?event={event_id}",
     ]
 
 def _extract_wp_series(obj: dict) -> list[float] | None:
     """
-    Look for a winProbability/odds stream with home team probability values.
-    Return a list[0..1] of home win probability over time.
+    Look for a winProbability-style series of home-team probabilities (0..1).
     """
-    # Common place: summary.winprobability
+    # Common: summary.winprobability[]
     try:
         wp = obj.get("winprobability")
         if isinstance(wp, list) and wp:
             series: list[float] = []
             for pt in wp:
-                # ESPN alternates property names; try both
-                p = pt.get("homeWinPercentage")
-                if p is None:
-                    p = pt.get("homeWinProb")
+                p = pt.get("homeWinPercentage") or pt.get("homeWinProb")
                 if p is None:
                     continue
-                # ESPN sometimes returns 0..1, sometimes 0..100
                 val = float(p)
                 if val > 1.0:
-                    val = val / 100.0
+                    val /= 100.0
                 series.append(max(0.0, min(1.0, val)))
             if series:
                 return series
     except Exception:
         pass
 
-    # Sometimes embedded under "predictor" or "winprobability" in another node
+    # Sometimes under play-by-play "plays"
     try:
-        predictor = obj.get("predictor") or {}
-        if isinstance(predictor, dict):
-            wp = predictor.get("homeWinProbability")
-            if wp:
-                # single number; not useful as a series
-                return [float(wp)]
-    except Exception:
-        pass
-
-    # Play-by-play trail
-    try:
-        drives = obj.get("winprobability") or obj.get("plays")
-        if isinstance(drives, list):
+        plays = obj.get("plays") or []
+        if isinstance(plays, list) and plays:
             series: list[float] = []
-            for d in drives:
-                p = d.get("homeWinProbability") or d.get("homeWinPercentage")
+            for pl in plays:
+                p = pl.get("homeWinProbability") or pl.get("homeWinPercentage")
                 if p is None:
                     continue
                 val = float(p)
                 if val > 1.0:
-                    val = val / 100.0
+                    val /= 100.0
                 series.append(max(0.0, min(1.0, val)))
             if series:
                 return series
@@ -312,12 +319,9 @@ def _extract_wp_series(obj: dict) -> list[float] | None:
 
     return None
 
-def fetch_win_probability_series(league_key: str, event_id: str, comp_id: str) -> list[float] | None:
-    """
-    Try several endpoints to get a home-win-probability series.
-    """
-    for base in _summary_urls(league_key, event_id):
-        url = f"{base}?event={event_id}"
+def fetch_win_probability_series(league_key: str, event_id: str, comp_id: str | None) -> list[float] | None:
+    """Try several endpoints to get a home-win-probability series."""
+    for url in _summary_urls(league_key, event_id):
         obj = _get(url)
         if not obj:
             continue
@@ -325,7 +329,22 @@ def fetch_win_probability_series(league_key: str, event_id: str, comp_id: str) -
         if series:
             _log(f"[DEBUG] WP series length={len(series)} for {event_id}")
             return series
-
     _log(f"[DEBUG] WP series not found for {event_id}")
     return None
 
+# Quick retry wrapper the main loop can call
+def fetch_wp_quick(sport_lower: str, event_id: str, comp_id: str | None) -> list[float] | None:
+    """Retry a few times quickly for late-arriving WP after final."""
+    schedule = [0, 10, 20, 35]  # seconds
+    league_key = sport_lower.upper()
+    start = time.time()
+    for i, target in enumerate(schedule):
+        sleep_for = target - (time.time() - start)
+        if sleep_for > 0:
+            time.sleep(sleep_for)
+        series = fetch_win_probability_series(league_key, event_id, comp_id)
+        if series:
+            if i > 0:
+                _log(f"[DEBUG] WP arrived on quick attempt {i+1}/{len(schedule)}")
+            return series
+    return None
