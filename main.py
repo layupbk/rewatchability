@@ -72,14 +72,20 @@ def calc_ei_from_home_series(series_raw):
 
 # ----------- Posting Logic ----------- #
 
-def format_post_text(sport, game, score_val, vibe):
+def sport_emoji(s_up: str) -> str:
+    return "🏀" if s_up == "NBA" else "🏈" if s_up == "NFL" else "⚾"
+
+def format_post_text(s_up, game, score_val, vibe):
     """
     Build the tweet text (abbreviated style)
     """
-    emoji = "🏀" if sport == "nba" else "🏈" if sport == "nfl" else "⚾"
+    emoji = sport_emoji(s_up)
     matchup = f"{emoji} {game['away']} @ {game['home']}"
     net = f" — {game['broadcast']}" if game.get("broadcast") else ""
-    date_str = datetime.datetime.now().strftime("%a · %-m/%-d/%y")
+    # Weekday + mm/dd/yy (no leading zeros for month/day)
+    now = datetime.datetime.now()
+    date_str = now.strftime("%a") + " · " + now.strftime("%-m/%-d/%y") if os.name != "nt" \
+        else now.strftime("%a") + " · " + now.strftime("%m/%d/%y").lstrip("0").replace("/0", "/")
 
     return (
         f"{matchup}{net} — FINAL\n"
@@ -89,13 +95,15 @@ def format_post_text(sport, game, score_val, vibe):
     )
 
 
-def post_once(sport, event_id, comp_id, game):
+def post_once(sport_lower, event_id, comp_id, game):
     """
     Fetch WP, compute EI, score, post.
     """
+    # Normalize sport for scoring/vibes
+    sport_up = sport_lower.upper()
 
     # Load WP series
-    series = fetch_wp_quick(sport, event_id, comp_id)
+    series = fetch_wp_quick(sport_lower, event_id, comp_id)
     if not series:
         print(f"[WAIT] no WP yet {event_id}", flush=True)
         return False
@@ -107,7 +115,7 @@ def post_once(sport, event_id, comp_id, game):
         s_min = s_max = None
 
     ei = calc_ei_from_home_series(series)
-    print(f"[EI] {sport} {event_id} len={len(series)} "
+    print(f"[EI] {sport_up} {event_id} len={len(series)} "
           f"min={s_min} max={s_max} EI={ei:.3f}", flush=True)
 
     # Reject placeholder WP series
@@ -115,12 +123,12 @@ def post_once(sport, event_id, comp_id, game):
         print(f"[WAIT] EI too small (likely placeholder WP). Will retry {event_id}.", flush=True)
         return False
 
-    # Score + vibe
-    scored = score_game(sport, ei)
+    # Score + vibe -------------- FIX IS HERE: pass sport_up --------------
+    scored = score_game(sport_up, ei)
     score_val = scored.score
     vibe = pick_vibe(score_val)
 
-    text = format_post_text(sport, game, score_val, vibe)
+    text = format_post_text(sport_up, game, score_val, vibe)
 
     print(text)
     print("-" * 40)
@@ -131,7 +139,7 @@ def post_once(sport, event_id, comp_id, game):
         print(f"[X] post failed for {event_id}", flush=True)
         return False
 
-    print(f"[POSTED] {event_id} ({sport})", flush=True)
+    print(f"[POSTED] {event_id} ({sport_up})", flush=True)
     posted_ids.add(event_id)
     save_ledger(posted_ids)
     return True
@@ -147,9 +155,9 @@ def run():
 
         print(f"[HB] checking dates: {d0} and {d1}", flush=True)
 
-        for sport in ["nba", "nfl", "mlb"]:
+        for sport_lower in ["nba", "nfl", "mlb"]:
             for date in [d0, d1]:
-                games = get_final_like_events(sport, date)
+                games = get_final_like_events(sport_lower, date)
                 print(f"[INFO] {date} FINAL-like events found: {len(games)}", flush=True)
 
                 for g in games:
@@ -161,9 +169,9 @@ def run():
                         continue
 
                     # Attempt post
-                    posted = post_once(sport, event_id, comp_id, g)
+                    posted = post_once(sport_lower, event_id, comp_id, g)
                     if not posted:
-                        # Save skip state? No, allow retry
+                        # allow retry next loop
                         pass
 
         time.sleep(60)
@@ -171,4 +179,3 @@ def run():
 
 if __name__ == "__main__":
     run()
-
