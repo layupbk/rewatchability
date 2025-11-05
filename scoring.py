@@ -1,50 +1,42 @@
+# scoring.py
+# Rewatchability Score™ master formulas (LOCKED)
+# Shared display range: 40–99, with NFL/MLB allowing a rare 100 when EI exceeds E_max.
+
+from __future__ import annotations
 from dataclasses import dataclass
 
 @dataclass
 class ScoreResult:
-    score: int  # final integer score to display (40–99 normally; 100 only at E_max+ for NFL/MLB)
+    score: int
+    sport: str
+    ei: float
 
-# -----------------------------
-# Helpers
-# -----------------------------
-
-def _ei_to_decimal(ei: float) -> float:
-    """Accept EI in decimal (0–10+) or percentage (0–100). If >1.5, assume percentage and divide by 100."""
-    try:
-        e = float(ei)
-    except Exception:
-        raise ValueError("EI must be numeric")
-    return e / 100.0 if e > 1.5 else e
-
-def _round_int(x: float) -> int:
-    """Round to nearest integer the way humans expect for a score display."""
-    return int(round(x))
-
-# -----------------------------
-# NBA / NCAAM (linear)
-# -----------------------------
-
+# ----------------------------
+# NBA (linear)
+# ----------------------------
 def _score_nba(ei: float) -> int:
-    # Score = clamp(4*EI + 40, 40..99)
-    raw = 4.0 * ei + 40.0
-    clamped = max(40.0, min(99.0, raw))
-    return _round_int(clamped)
+    """
+    NBA: Score = min(99, max(40, 4*EI + 40))
+    EI is Σ|ΔWP| on a 0..1 scale per step (sum can exceed 1).
+    """
+    s = 4.0 * float(ei) + 40.0
+    if s < 40:
+        s = 40.0
+    if s > 99:
+        s = 99.0
+    return int(round(s))
 
-# NCAAM mirrors NBA curve
-_score_ncaam = _score_nba
+# ----------------------------
+# NFL (piecewise, 2012–2024 REG calibration, true 40 floor)
+# ----------------------------
+NFL_E_MIN  = 0.636
+NFL_E_MED  = 3.772
+NFL_E_90   = 6.315
+NFL_E_99   = 8.1511504
+NFL_E_MAX  = 10.587
 
-# -----------------------------
-# NFL / NCAAF (piecewise; 2012–2024 reg-season calibration)
-# -----------------------------
-
-NFL_E_MIN = 0.636
-NFL_E_MED = 3.772
-NFL_E_90  = 6.315
-NFL_E_99  = 8.1511504
-NFL_E_MAX = 10.587
-
-def _score_nfl(ei: float) -> int:
-    E = ei
+def _score_nfl(e: float) -> int:
+    E = float(e)
     if E <= NFL_E_MIN:
         s = 40.0
     elif E <= NFL_E_MED:
@@ -52,30 +44,27 @@ def _score_nfl(ei: float) -> int:
     elif E <= NFL_E_90:
         s = 70.0 + 20.0 * (E - NFL_E_MED) / (NFL_E_90 - NFL_E_MED)
     elif E <= NFL_E_99:
-        s = 90.0 + 9.0 * (E - NFL_E_90) / (NFL_E_99 - NFL_E_90)
+        s = 90.0 + 9.0  * (E - NFL_E_90) / (NFL_E_99 - NFL_E_90)
     elif E <= NFL_E_MAX:
-        s = 99.0 + 1.0 * (E - NFL_E_99) / (NFL_E_MAX - NFL_E_99)
+        s = 99.0 + 1.0  * (E - NFL_E_99) / (NFL_E_MAX - NFL_E_99)
     else:
-        # Rare all-timer
         s = 100.0
-    # Clamp floor to 40; allow rare 100s by not capping at 99 here.
-    return _round_int(max(40.0, s))
+    # Clamp visible floor to 40; allow rare 100 for outliers
+    if s < 40.0: s = 40.0
+    if s > 100.0: s = 100.0
+    return int(round(s))
 
-# NCAAF mirrors NFL curve
-_score_ncaaf = _score_nfl
+# ----------------------------
+# MLB (piecewise, 2016–2025 REG calibration; 2020 excluded)
+# ----------------------------
+MLB_E_MIN  = 0.524
+MLB_E_MED  = 2.380
+MLB_E_90   = 6.312072
+MLB_E_99   = 7.701617
+MLB_E_MAX  = 9.426000
 
-# -----------------------------
-# MLB (piecewise; 2016–2025 reg-season calibration, 2020 excluded)
-# -----------------------------
-
-MLB_E_MIN = 0.524
-MLB_E_MED = 2.380
-MLB_E_90  = 6.312072
-MLB_E_99  = 7.701617
-MLB_E_MAX = 9.426000
-
-def _score_mlb(ei: float) -> int:
-    E = ei
+def _score_mlb(e: float) -> int:
+    E = float(e)
     if E <= MLB_E_MIN:
         s = 40.0
     elif E <= MLB_E_MED:
@@ -83,37 +72,36 @@ def _score_mlb(ei: float) -> int:
     elif E <= MLB_E_90:
         s = 70.0 + 20.0 * (E - MLB_E_MED) / (MLB_E_90 - MLB_E_MED)
     elif E <= MLB_E_99:
-        s = 90.0 + 9.0 * (E - MLB_E_90) / (MLB_E_99 - MLB_E_90)
+        s = 90.0 + 9.0  * (E - MLB_E_90) / (MLB_E_99 - MLB_E_90)
     elif E <= MLB_E_MAX:
-        s = 99.0 + 1.0 * (E - MLB_E_99) / (MLB_E_MAX - MLB_E_99)
+        s = 99.0 + 1.0  * (E - MLB_E_99) / (MLB_E_MAX - MLB_E_99)
     else:
         s = 100.0
-    return _round_int(max(40.0, s))
+    if s < 40.0: s = 40.0
+    if s > 100.0: s = 100.0
+    return int(round(s))
 
-# -----------------------------
-# Public entry point
-# -----------------------------
-
-def score_game(sport: str, ei) -> ScoreResult:
+# ----------------------------
+# Public entrypoint
+# ----------------------------
+def score_game(sport: str, ei: float) -> ScoreResult:
     """
-    Compute Rewatchability Score™ for a single game.
-    - sport: one of 'NBA','NFL','MLB','NCAAF','NCAAM'
-    - ei: Excitement Index (decimal). If passed as percentage (e.g., 875), we auto-convert.
+    sport: 'NBA' | 'NFL' | 'MLB'  (UPPERCASE)
+    ei: Excitement Index on decimal scale (0..1 per step; SUM of abs diffs)
     """
-    s = sport.upper().strip()
-    E = _ei_to_decimal(float(ei))
-
-    if s == "NBA":
-        score = _score_nba(E)
-    elif s == "NCAAM":
-        score = _score_ncaam(E)
-    elif s == "NFL":
-        score = _score_nfl(E)
-    elif s == "NCAAF":
-        score = _score_ncaaf(E)
-    elif s == "MLB":
-        score = _score_mlb(E)
+    key = (sport or "").upper().strip()
+    # Defensive: if EI was accidentally given in percent points, convert
+    E = float(ei)
+    if E > 120:      # impossible if decimal-sum; definitely percent or garbage
+        E = E / 100.0
+    # Route to formula
+    if key == "NBA":
+        s = _score_nba(E)
+    elif key == "NFL":
+        s = _score_nfl(E)
+    elif key == "MLB":
+        s = _score_mlb(E)
     else:
-        raise ValueError("Unsupported sport")
-
-    return ScoreResult(score=score)
+        # Unknown sport: return safe floor so we don't publish junk
+        s = 40
+    return ScoreResult(score=s, sport=key, ei=E)
