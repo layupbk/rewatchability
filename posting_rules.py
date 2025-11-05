@@ -17,7 +17,7 @@ def clean_hashtag_text(text: str) -> str:
     return re.sub(r"[^A-Za-z0-9]", "", text.strip())
 
 def league_hashtag(sport: str) -> str:
-    """Force college names: NCAAF, NCAAM."""
+    """Force league hashtag names; college uses NCAAF/NCAAM."""
     mapping = {
         "NBA": "NBA",
         "NFL": "NFL",
@@ -45,11 +45,8 @@ def event_hashtag(event_name: str | None) -> str | None:
 
 def format_post(game, score, vibe, date, sport, neutral_site=False, network=None):
     """
-    Tweet text (no hashtags).
-    game: {"away": "...", "home": "..."}
-    date: 'MM/D/YY'
-    Note: we still show network (if national) in the headline text for human context,
-    but we never hashtag the network anymore.
+    Tweet text (no hashtags). `date` is already formatted (e.g., 'Tue · 11/4/25').
+    Shows broadcaster in the headline if national; never hashtags broadcaster.
     """
     emoji = sport_emoji(sport)
     sep = "vs." if neutral_site else "@"
@@ -69,12 +66,14 @@ def format_video_caption(game, score, vibe, date, sport,
                          neutral_site=False, network=None,
                          is_national=True, event_name: str | None = None):
     """
-    Video caption (same as tweet, plus hashtags):
-    Base 4 tags:
-      #RewatchabilityScore #<League> #<AwayTeam> #<HomeTeam>
-    If an event name exists (from ESPN), add it as the 5th tag:
-      #<EventName>
-    We DO NOT add broadcaster/network hashtags anymore.
+    Video caption (same text block as tweet, plus hashtags).
+
+    Hashtags:
+      1) #RewatchabilityScore
+      2) #<League>      (NBA/NFL/MLB/NCAAF/NCAAM)
+      3) #<AwayTeam>    (spaces/punct removed)
+      4) #<HomeTeam>    (spaces/punct removed)
+      5) #<EventName>   (IF special event/tournament exists)
     """
     text = format_post(game, score, vibe, date, sport, neutral_site, network)
 

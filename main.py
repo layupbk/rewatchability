@@ -5,18 +5,18 @@ from espn_adapter import list_final_events_for_date, fetch_win_probability_serie
 from scoring import score_game
 from vibe_tags import vibe_tag_from_score
 from posting_rules import format_post, format_video_caption
+from formatting import to_weekday_mm_d_yy
 
-LEAGUES = ["NBA", "NFL", "MLB", "NCAAM", "NCAAF"]
+# Only post pro leagues for now; college disabled until scoring is added
+LEAGUES = ["NBA", "NFL", "MLB"]
+ALLOWED_SPORTS = {"NBA", "NFL", "MLB"}
+
 POLL_EVERY_SECONDS = 60
 WP_RETRY_SCHEDULE = [0, 10, 20, 35]
 
 
-def to_mm_d_yy(date_iso: str) -> str:
-    d = datetime.strptime(date_iso, "%Y-%m-%d")
-    return d.strftime("%m/%d/%y").lstrip("0").replace("/0", "/")
-
 def today_iso_utc() -> str:
-    # avoid deprecation warnings by using timezone-aware now()
+    # timezone-aware now to avoid warnings
     return datetime.now(timezone.utc).strftime("%Y-%m-%d")
 
 def yesterday_iso_utc() -> str:
@@ -46,7 +46,11 @@ def fetch_wp_quick(sport: str, event_id: str, comp_id: str) -> list[float] | Non
     return None
 
 def post_once(ev: dict, date_iso: str) -> bool:
-    sport = ev["sport"]
+    sport = ev["sport"].upper()
+    if sport not in ALLOWED_SPORTS:
+        print(f"[SKIP] {sport} disabled (college scoring not enabled yet)", flush=True)
+        return False
+
     road = ev["road"]
     home = ev["home"]
     network = ev["network"]
@@ -55,28 +59,41 @@ def post_once(ev: dict, date_iso: str) -> bool:
     event_id = ev["event_id"]
     comp_id = ev["comp_id"]
 
+    # Fast WP fetch (outer loop will try again next minute if not ready)
     series = fetch_wp_quick(sport, event_id, comp_id)
     if not series:
         return False
 
+    # EI -> Score -> Vibe
     ei = calc_ei_from_home_series(series)
     score = score_game(sport, ei).score
     vibe = vibe_tag_from_score(score)
 
     game = {"away": road, "home": home}
-    date_line = to_mm_d_yy(date_iso)
+    date_line = to_weekday_mm_d_yy(date_iso)  # e.g., 'Tue · 11/4/25'
 
     tweet = format_post(
-        game=game, score=score, vibe=vibe, date=date_line,
-        sport=sport, neutral_site=neutral, network=network
+        game=game,
+        score=score,
+        vibe=vibe,
+        date=date_line,
+        sport=sport,
+        neutral_site=neutral,
+        network=network
     )
     print(tweet.strip(), flush=True)
     print("-" * 40, flush=True)
 
     caption = format_video_caption(
-        game=game, score=score, vibe=vibe, date=date_line,
-        sport=sport, neutral_site=neutral, network=network,
-        is_national=bool(network), event_name=event_name
+        game=game,
+        score=score,
+        vibe=vibe,
+        date=date_line,
+        sport=sport,
+        neutral_site=neutral,
+        network=network,
+        is_national=bool(network),
+        event_name=event_name
     )
     print(caption.strip(), flush=True)
     print("=" * 60, flush=True)
@@ -92,7 +109,7 @@ def main():
             today = today_iso_utc()
             yday = yesterday_iso_utc()
 
-            # heartbeat line so you see it’s alive
+            # heartbeat so you can see activity in logs
             print(f"[HB] checking dates: {yday} and {today}", flush=True)
 
             for date_iso in (yday, today):
@@ -116,3 +133,4 @@ def main():
 
 if __name__ == "__main__":
     main()
+
