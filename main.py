@@ -6,17 +6,21 @@ from scoring import score_game
 from vibe_tags import vibe_tag_from_score
 from posting_rules import format_post, format_video_caption
 from formatting import to_weekday_mm_d_yy
+from publisher_x import post_to_x  # Twitter poster
 
-# Only post pro leagues for now; college disabled until scoring is added
+# NEW: rolling ledger helpers
+from ledger import load_ledger, save_ledger, prune_ledger, already_posted, mark_posted
+
+# Post only pro leagues for now; college disabled until scoring is added
 LEAGUES = ["NBA", "NFL", "MLB"]
 ALLOWED_SPORTS = {"NBA", "NFL", "MLB"}
 
 POLL_EVERY_SECONDS = 60
+# quick retry timings (seconds elapsed since start of this attempt)
 WP_RETRY_SCHEDULE = [0, 10, 20, 35]
 
 
 def today_iso_utc() -> str:
-    # timezone-aware now to avoid warnings
     return datetime.now(timezone.utc).strftime("%Y-%m-%d")
 
 def yesterday_iso_utc() -> str:
@@ -53,13 +57,13 @@ def post_once(ev: dict, date_iso: str) -> bool:
 
     road = ev["road"]
     home = ev["home"]
-    network = ev["network"]
-    neutral = ev["neutral_site"]
-    event_name = ev["event_name"]
+    network = ev["network"]               # None/"" if not national
+    neutral = ev["neutral_site"]          # True for neutral-site games
+    event_name = ev["event_name"]         # Event/tournament name if present
     event_id = ev["event_id"]
     comp_id = ev["comp_id"]
 
-    # Fast WP fetch (outer loop will try again next minute if not ready)
+    # Fast WP fetch (outer loop will try again next minute if still not ready)
     series = fetch_wp_quick(sport, event_id, comp_id)
     if not series:
         return False
@@ -72,6 +76,7 @@ def post_once(ev: dict, date_iso: str) -> bool:
     game = {"away": road, "home": home}
     date_line = to_weekday_mm_d_yy(date_iso)  # e.g., 'Tue · 11/4/25'
 
+    # Build tweet text
     tweet = format_post(
         game=game,
         score=score,
@@ -84,6 +89,7 @@ def post_once(ev: dict, date_iso: str) -> bool:
     print(tweet.strip(), flush=True)
     print("-" * 40, flush=True)
 
+    # Build video caption text (future use)
     caption = format_video_caption(
         game=game,
         score=score,
@@ -98,10 +104,18 @@ def post_once(ev: dict, date_iso: str) -> bool:
     print(caption.strip(), flush=True)
     print("=" * 60, flush=True)
 
+    # Post to Twitter (X)
+    post_to_x(tweet)
+
     return True
 
 def main():
-    posted_ids: set[str] = set()
+    # Load and prune rolling ledger (7 days by default)
+    ledger = load_ledger()
+    prune_ledger(ledger)      # drop old ids
+    save_ledger(ledger)       # write file back (keeps it tidy)
+    print(f"[RUN] ledger ready with {len(ledger)} ids", flush=True)
+
     print("[RUN] Cloud worker started. Polling every 60s.", flush=True)
 
     while True:
@@ -118,11 +132,19 @@ def main():
 
                 for ev in events:
                     eid = ev.get("event_id")
-                    if not eid or eid in posted_ids:
+                    if not eid:
                         continue
+
+                    # Rolling-ledger duplicate guard (works for tweets now; videos later)
+                    if already_posted(ledger, eid):
+                        print(f"[SKIP] already posted {eid}", flush=True)
+                        continue
+
                     ok = post_once(ev, date_iso)
                     if ok:
-                        posted_ids.add(eid)
+                        # Mark this event as posted
+                        mark_posted(ledger, eid)
+                        save_ledger(ledger)
                         print(f"[POSTED] {eid} ({ev['sport']})", flush=True)
                     else:
                         print(f"[WAIT] WP not ready yet for {eid}", flush=True)
@@ -133,4 +155,5 @@ def main():
 
 if __name__ == "__main__":
     main()
+
 
