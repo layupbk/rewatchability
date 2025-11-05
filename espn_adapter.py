@@ -1,45 +1,56 @@
 # espn_adapter.py
+# Full replacement: FINAL-like event listing + robust national TV detection
+# + Win Probability fetching with two fallbacks (summary, play-by-play).
+
 import requests
 from typing import List, Dict, Optional
 
-# ------------------------------
-# Helpers
-# ------------------------------
-
+# -------------------------------------------------
+# Maps leagues to ESPN paths (pros active; college optional later)
+# -------------------------------------------------
 SPORT_PATH = {
-    "NBA": "basketball/nba",
-    "NFL": "football/nfl",
-    "MLB": "baseball/mlb",
+    "NBA":  "basketball/nba",
+    "NFL":  "football/nfl",
+    "MLB":  "baseball/mlb",
+    # "NCAAF": "football/college-football",                 # enable later
+    # "NCAAM": "basketball/mens-college-basketball",        # enable later
 }
 
+# -------------------------------------------------
+# Small HTTP helper
+# -------------------------------------------------
 def _http_get_json(url: str, timeout: int = 10):
-    r = requests.get(url, timeout=timeout)
-    if r.status_code != 200:
-        print(f"[DEBUG] GET {url} -> {r.status_code}", flush=True)
-        return None
     try:
+        r = requests.get(url, timeout=timeout)
+        if r.status_code != 200:
+            print(f"[DEBUG] GET {url} -> {r.status_code}", flush=True)
+            return None
         return r.json()
     except Exception as e:
-        print(f"[DEBUG] JSON parse error for {url}: {e}", flush=True)
+        print(f"[DEBUG] HTTP/JSON error for {url}: {e}", flush=True)
         return None
 
+def _normalize(s: str) -> str:
+    return (s or "").strip().lower()
+
+# -------------------------------------------------
+# Status helpers
+# -------------------------------------------------
 def _is_final_like(event: dict) -> bool:
     """
-    ESPN events have status info in a few places. We accept:
-    - status.type.completed == True
-    - status.type.state == 'post'
-    - shortText contains 'Final'
+    Consider an event 'FINAL-like' if ESPN marks it completed/post or says 'Final'.
     """
     try:
         stat = event.get("status") or {}
-        stype = stat.get("type") or {}
-        if stype.get("completed") is True:
+        t = stat.get("type") or {}
+        if t.get("completed") is True:
             return True
-        if (stype.get("state") or "").lower() == "post":
+        if _normalize(t.get("state")) == "post":
             return True
-        if "final" in (stat.get("type", {}).get("shortDetail", "") or "").lower():
+        # Fallback string checks
+        if "final" in _normalize(t.get("shortDetail")):
             return True
-        if "final" in (stat.get("type", {}).get("description", "") or "").lower():
+        if "final" in _normalize(t.get("description")):
             return True
     except Exception:
         pass
@@ -47,9 +58,9 @@ def _is_final_like(event: dict) -> bool:
 
 def _extract_competitors(event: dict):
     """
-    Return (road_name, home_name, neutral_site_bool, comp_id) from the first competition.
+    Return (road_name, home_name, neutral_site_bool, comp_id) from first competition.
     """
-    comps = (event.get("competitions") or [])
+    comps = event.get("competitions") or []
     if not comps:
         return None, None, False, None
     comp0 = comps[0]
@@ -59,28 +70,23 @@ def _extract_competitors(event: dict):
     road = home = None
     for c in comp0.get("competitors", []):
         name = (c.get("team", {}) or {}).get("displayName") or (c.get("team", {}) or {}).get("name")
-        ha = c.get("homeAway")
-        if ha == "home":
+        if c.get("homeAway") == "home":
             home = name
-        elif ha == "away":
+        elif c.get("homeAway") == "away":
             road = name
 
     return road, home, neutral, comp_id
 
 def _extract_event_name(event: dict) -> Optional[str]:
     """
-    Try a few places for an event/tournament name if present.
+    Try to pull a meaningful event/tournament name if present.
+    Skip generic "Team A vs Team B" titles.
     """
-    # Sometimes on pro side there isn't a special name; return None if nothing meaningful.
-    header_name = (event.get("name") or "").strip()
-    if header_name:
-        # Often "Lakers vs. Warriors" (not useful). Skip if it just mirrors teams.
-        if " vs " in header_name.lower() or " vs. " in header_name.lower() or " at " in header_name.lower():
-            pass
-        else:
-            return header_name
+    title = (event.get("name") or "").strip()
+    low = title.lower()
+    if title and not any(k in low for k in [" vs ", " vs.", " at "]):
+        return title
 
-    # Competitions notes/title
     comps = event.get("competitions") or []
     if comps:
         notes = comps[0].get("notes") or []
@@ -88,34 +94,59 @@ def _extract_event_name(event: dict) -> Optional[str]:
             txt = (n.get("headline") or "").strip()
             if txt:
                 return txt
-
     return None
 
+# -------------------------------------------------
+# National broadcast detection (robust)
+# -------------------------------------------------
 def _extract_network_national(event: dict) -> Optional[str]:
     """
-    Return a national network string like "ABC", "ESPN", "TNT", "FOX", "CBS", "NBC/Peacock", etc.
-    If not national, return None.
+    Return a national network string (e.g., 'NBC/Peacock', 'ESPN') or None if not national.
+    Uses ESPN's market flag when present, and falls back to alias matching.
     """
     comps = event.get("competitions") or []
     if not comps:
         return None
     comp0 = comps[0]
 
-    # ESPN puts broadcasts under competitions[0].broadcasts
     broadcasts = comp0.get("broadcasts") or []
-    # Look for items where market == 'national'
-    national_names = []
+    if not broadcasts:
+        return None
+
+    # Broad set of national aliases, normalized
+    NATIONAL_ALIASES = {
+        "abc", "espn", "espn2", "espnu", "espn u", "espnews",
+        "nbc", "peacock", "cbs", "cbs sports network", "cbssn",
+        "fox", "fs1", "fox sports 1", "fs2", "fox sports 2",
+        "tnt", "tbs", "truetv", "true tv", "nba tv", "nbatv",
+        "mlb network", "nfl network",
+        "big ten network", "btn", "b1g network", "b1g", "b1g+",
+        "sec network", "secn", "secn+",
+        "acc network", "accn", "accnx",
+        "prime video", "amazon prime", "amazon", "espn+",
+    }
+
+    national_names: list[str] = []
+
+    # Pass 1: trust ESPN market flag
     for b in broadcasts:
-        market = (b.get("market") or "").lower()
-        names = b.get("names") or []
+        market = _normalize(b.get("market", ""))
+        names = [str(n) for n in (b.get("names") or []) if n]
         if market == "national" and names:
-            # Some events list multiple names, e.g., ["NBC", "Peacock"]
-            national_names.extend([str(n) for n in names if n])
+            national_names.extend(names)
+
+    # Pass 2: if market not set, alias-match
+    if not national_names:
+        for b in broadcasts:
+            names = [str(n) for n in (b.get("names") or []) if n]
+            lowers = [_normalize(n) for n in names]
+            if any(n in NATIONAL_ALIASES for n in lowers):
+                national_names.extend(names)
 
     if not national_names:
         return None
 
-    # Deduplicate while preserving order
+    # Dedup + join (e.g., "NBC/Peacock")
     seen = set()
     uniq = []
     for n in national_names:
@@ -123,18 +154,16 @@ def _extract_network_national(event: dict) -> Optional[str]:
             seen.add(n)
             uniq.append(n)
 
-    # Join multiple (e.g., NBC/Peacock)
     return "/".join(uniq)
 
-# ------------------------------
-# Public: list events for a date
-# ------------------------------
-
+# -------------------------------------------------
+# Public: list FINAL-like events per date
+# -------------------------------------------------
 def list_final_events_for_date(date_iso: str, leagues: List[str]) -> List[Dict]:
     """
-    For the given yyyy-mm-dd date, pull FINAL-like events for the requested leagues.
-    Return list of dicts with:
+    Return list of dicts with keys:
       sport, road, home, network, neutral_site, event_name, event_id, comp_id
+    Only includes FINAL-like events.
     """
     out: List[Dict] = []
     for league in leagues:
@@ -142,10 +171,10 @@ def list_final_events_for_date(date_iso: str, leagues: List[str]) -> List[Dict]:
         if not sport_path:
             continue
 
-        # ESPN Scoreboard
         url = f"https://site.api.espn.com/apis/site/v2/sports/{sport_path}/scoreboard?dates={date_iso}"
         data = _http_get_json(url)
         if not data:
+            print(f"[DEBUG] scoreboard load failed for {league}", flush=True)
             continue
 
         events = data.get("events") or []
@@ -159,8 +188,8 @@ def list_final_events_for_date(date_iso: str, leagues: List[str]) -> List[Dict]:
             if not (event_id and road and home and comp_id):
                 continue
 
-            network = _extract_network_national(ev)  # None if non-national
-            event_name = _extract_event_name(ev)     # may be None
+            network = _extract_network_national(ev)   # None if non-national
+            event_name = _extract_event_name(ev)      # may be None
 
             out.append({
                 "sport": league.upper(),
@@ -179,18 +208,12 @@ def list_final_events_for_date(date_iso: str, leagues: List[str]) -> List[Dict]:
 
     return out
 
-# ------------------------------
-# Public: Win Probability series
-# ------------------------------
-
+# -------------------------------------------------
+# Public: Win Probability series (HOME WP in [0,1])
+# Tries primary (stub) -> summary -> play-by-play
+# -------------------------------------------------
 def fetch_win_probability_series(sport: str, event_id: str, comp_id: str) -> Optional[List[float]]:
-    """
-    Return a list of HOME win probabilities (floats 0..1) in time order.
-    Strategy:
-      1) Try a primary fetch (stubbed here; return None to fall back).
-      2) Fallback to ESPN 'summary?event=' which usually exposes 'winprobability'.
-    """
-    # 1) Primary (if you later wire a direct endpoint, do it here)
+    # 1) Primary (leave as stub; add your direct endpoint later if desired)
     try:
         primary = _fetch_wp_primary(sport, event_id, comp_id)
         if primary and len(primary) >= 2:
@@ -199,68 +222,116 @@ def fetch_win_probability_series(sport: str, event_id: str, comp_id: str) -> Opt
     except Exception as e:
         print(f"[DEBUG] WP primary error {event_id}: {e}", flush=True)
 
-    # 2) Fallback: ESPN summary
-    try:
-        sport_path = SPORT_PATH.get(sport.upper())
-        if not sport_path:
-            return None
+    # 2) Fallback A: summary?event=... → winprobability
+    series = _wp_from_summary(sport, event_id)
+    if series and len(series) >= 2:
+        print(f"[DEBUG] WP fallback SUMMARY ok: {event_id} points={len(series)}", flush=True)
+        return series
 
-        url = f"https://site.api.espn.com/apis/site/v2/sports/{sport_path}/summary?event={event_id}"
-        data = _http_get_json(url, timeout=8)
-        if not data:
-            print(f"[DEBUG] summary load failed for {event_id}", flush=True)
-            return None
+    # 3) Fallback B: playbyplay?event=... → scan plays for WP
+    series = _wp_from_playbyplay(sport, event_id)
+    if series and len(series) >= 2:
+        print(f"[DEBUG] WP fallback PBP ok: {event_id} points={len(series)}", flush=True)
+        return series
 
-        # Identify home team id if needed (usually not required because percentages are explicit)
-        home_team_id = None
-        try:
-            comps = data.get("header", {}).get("competitions") or data.get("competitions") or []
-            if comps:
-                comp0 = comps[0]
-                for c in comp0.get("competitors", []):
-                    if c.get("homeAway") == "home":
-                        home_team_id = str(c.get("id") or c.get("team", {}).get("id") or "")
-                        break
-        except Exception:
-            pass
+    print(f"[DEBUG] WP unavailable for {event_id}", flush=True)
+    return None
 
-        wp_list = data.get("winprobability")
-        if not isinstance(wp_list, list) or len(wp_list) < 2:
-            print(f"[DEBUG] no winprobability in summary for {event_id}", flush=True)
-            return None
+# -------------------- internals --------------------
 
+def _fetch_wp_primary(sport: str, event_id: str, comp_id: str) -> Optional[List[float]]:
+    """
+    Stub for a direct probabilities endpoint if you add one later.
+    Returning None makes the fallbacks run.
+    """
+    return None
+
+def _wp_from_summary(sport: str, event_id: str) -> Optional[List[float]]:
+    sport_path = SPORT_PATH.get(sport.upper())
+    if not sport_path:
+        return None
+    url = f"https://site.api.espn.com/apis/site/v2/sports/{sport_path}/summary?event={event_id}"
+    data = _http_get_json(url, timeout=8)
+    if not data:
+        return None
+
+    wp_list = data.get("winprobability")
+    if not isinstance(wp_list, list) or len(wp_list) < 2:
+        return None
+
+    home_series: List[float] = []
+    for pt in wp_list:
+        if "homeWinPercentage" in pt:
+            try:
+                home_series.append(float(pt["homeWinPercentage"]))
+                continue
+            except Exception:
+                pass
+        if "awayWinPercentage" in pt:
+            try:
+                aw = float(pt["awayWinPercentage"])
+                home_series.append(max(0.0, min(1.0, 1.0 - aw)))
+                continue
+            except Exception:
+                pass
+        # else skip point
+
+    return home_series if len(home_series) >= 2 else None
+
+def _wp_from_playbyplay(sport: str, event_id: str) -> Optional[List[float]]:
+    """
+    Scan ESPN play-by-play for winprobability records.
+    Some sports store WP at the root, some on each play item.
+    """
+    sport_path = SPORT_PATH.get(sport.upper())
+    if not sport_path:
+        return None
+    url = f"https://site.api.espn.com/apis/site/v2/sports/{sport_path}/playbyplay?event={event_id}"
+    data = _http_get_json(url, timeout=8)
+    if not data:
+        return None
+
+    # Case 1: root-level winprobability list (same shape as summary)
+    wp_list = data.get("winprobability")
+    if isinstance(wp_list, list) and len(wp_list) >= 2:
         home_series: List[float] = []
         for pt in wp_list:
             if "homeWinPercentage" in pt:
                 try:
                     home_series.append(float(pt["homeWinPercentage"]))
-                    continue
                 except Exception:
                     pass
-            if "awayWinPercentage" in pt:
+            elif "awayWinPercentage" in pt:
                 try:
                     aw = float(pt["awayWinPercentage"])
                     home_series.append(max(0.0, min(1.0, 1.0 - aw)))
-                    continue
                 except Exception:
                     pass
-            # If neither present (rare), skip that point.
-
         if len(home_series) >= 2:
-            print(f"[DEBUG] WP fallback ok: {event_id} points={len(home_series)}", flush=True)
             return home_series
 
-        print(f"[DEBUG] fallback parsed but too short for {event_id}", flush=True)
-        return None
+    # Case 2: per-play embedding (rare; scan plays)
+    try:
+        comps = data.get("competitions") or []
+        plays = comps[0].get("plays") if comps else None
+        if isinstance(plays, list) and plays:
+            home_series2: List[float] = []
+            for p in plays:
+                wp = p.get("winprobability") or {}
+                if "homeWinPercentage" in wp:
+                    try:
+                        home_series2.append(float(wp["homeWinPercentage"]))
+                    except Exception:
+                        pass
+                elif "awayWinPercentage" in wp:
+                    try:
+                        aw = float(wp["awayWinPercentage"])
+                        home_series2.append(max(0.0, min(1.0, 1.0 - aw)))
+                    except Exception:
+                        pass
+            if len(home_series2) >= 2:
+                return home_series2
+    except Exception:
+        pass
 
-    except Exception as e:
-        print(f"[DEBUG] WP fallback error {event_id}: {e}", flush=True)
-        return None
-
-def _fetch_wp_primary(sport: str, event_id: str, comp_id: str) -> Optional[List[float]]:
-    """
-    Stub for a direct probabilities endpoint if you add one later.
-    Returning None makes the fallback run immediately.
-    """
     return None
-
