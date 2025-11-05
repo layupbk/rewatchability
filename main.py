@@ -1,46 +1,45 @@
-import os, time, datetime
-from dotenv import load_dotenv
+import os, time, datetime, json
 
 from espn_adapter import get_final_like_events, fetch_wp_quick
 from scoring import score_game
 from vibe_tags import pick_vibe
-from post_x import post_to_x
-
-load_dotenv()
+from publisher_x import post_to_x  # uses OAuth1 v1.1 poster
 
 LEDGER_FILE = "/data/posted_ledger.json"
-
 
 # ---------------- Ledger ---------------- #
 
 def load_ledger():
     try:
-        import json
-        with open(LEDGER_FILE, "r") as f:
+        with open(LEDGER_FILE, "r", encoding="utf-8") as f:
             ids = json.load(f)
             print(f"[RUN] ledger ready with {len(ids)} ids", flush=True)
             return set(ids)
-    except:
-        print("[LEDGER] saved 0 ids to /data/posted_ledger.json", flush=True)
+    except FileNotFoundError:
+        print("[LEDGER] no ledger found; starting fresh", flush=True)
+        return set()
+    except Exception as e:
+        print(f"[LEDGER] load error: {e}; starting empty", flush=True)
         return set()
 
-
-def save_ledger(ids):
-    import json
-    with open(LEDGER_FILE, "w") as f:
-        json.dump(list(ids), f)
-    print(f"[LEDGER] saved {len(ids)} ids to /data/posted_ledger.json", flush=True)
-
+def save_ledger(ids: set[str]):
+    try:
+        with open(LEDGER_FILE, "w", encoding="utf-8") as f:
+            json.dump(sorted(list(ids)), f)
+        print(f"[LEDGER] saved {len(ids)} ids to {LEDGER_FILE}", flush=True)
+    except Exception as e:
+        print(f"[LEDGER] save error: {e}", flush=True)
 
 posted_ids = load_ledger()
 
-
-# ----------- EI Fix Logic ----------- #
+# ----------- EI Logic ----------- #
 
 def calc_ei_from_home_series(series_raw):
     """
-    Build EI = Σ|Δ homeWP|.
-    Accepts raw ESPN WP list and normalizes percent→decimal when needed.
+    EI = Σ|Δ homeWP|
+    - Accepts 0..1 or 0..100.
+    - Drops bad values.
+    - Auto-converts percents to decimals.
     """
     if not series_raw or len(series_raw) < 2:
         return 0.0
@@ -51,14 +50,13 @@ def calc_ei_from_home_series(series_raw):
             f = float(v)
             if f == f:  # not NaN
                 clean.append(f)
-        except:
+        except Exception:
             pass
 
     if len(clean) < 2:
         return 0.0
 
-    # Normalize if looks like percentages
-    if max(clean) > 1.5:
+    if max(clean) > 1.5:  # looks like percent points
         clean = [x / 100.0 for x in clean]
 
     total = 0.0
@@ -66,88 +64,81 @@ def calc_ei_from_home_series(series_raw):
     for p in clean[1:]:
         total += abs(p - prev)
         prev = p
-
     return total
 
-
-# ----------- Posting Logic ----------- #
+# ----------- Formatting ----------- #
 
 def sport_emoji(s_up: str) -> str:
     return "🏀" if s_up == "NBA" else "🏈" if s_up == "NFL" else "⚾"
 
-def format_post_text(s_up, game, score_val, vibe):
-    """
-    Build the tweet text (abbreviated style)
-    """
+def date_line_now() -> str:
+    # Weekday + mm/dd/yy; Windows can't use %-m so we strip leading zero
+    now = datetime.datetime.now()
+    if os.name == "nt":
+        return now.strftime("%a") + " · " + now.strftime("%m/%d/%y").lstrip("0").replace("/0", "/")
+    return now.strftime("%a") + " · " + now.strftime("%-m/%-d/%y")
+
+def format_post_text(s_up: str, game: dict, score_val: int, vibe: str) -> str:
     emoji = sport_emoji(s_up)
     matchup = f"{emoji} {game['away']} @ {game['home']}"
     net = f" — {game['broadcast']}" if game.get("broadcast") else ""
-    # Weekday + mm/dd/yy (no leading zeros for month/day)
-    now = datetime.datetime.now()
-    date_str = now.strftime("%a") + " · " + now.strftime("%-m/%-d/%y") if os.name != "nt" \
-        else now.strftime("%a") + " · " + now.strftime("%m/%d/%y").lstrip("0").replace("/0", "/")
-
     return (
         f"{matchup}{net} — FINAL\n"
         f"Rewatchability Score™: {score_val}\n"
         f"{vibe}\n"
-        f"{date_str}"
+        f"{date_line_now()}"
     )
 
+# ----------- Posting Flow ----------- #
 
-def post_once(sport_lower, event_id, comp_id, game):
-    """
-    Fetch WP, compute EI, score, post.
-    """
+def post_once(sport_lower: str, event_id: str, comp_id: str | None, game: dict) -> bool:
     # Normalize sport for scoring/vibes
     sport_up = sport_lower.upper()
 
-    # Load WP series
+    # Try to get WP quickly (adapter includes small internal retries)
     series = fetch_wp_quick(sport_lower, event_id, comp_id)
     if not series:
         print(f"[WAIT] no WP yet {event_id}", flush=True)
         return False
 
-    # Debug WP info
+    # Debug WP stats
     try:
         s_min, s_max = min(series), max(series)
-    except:
+    except Exception:
         s_min = s_max = None
 
     ei = calc_ei_from_home_series(series)
-    print(f"[EI] {sport_up} {event_id} len={len(series)} "
-          f"min={s_min} max={s_max} EI={ei:.3f}", flush=True)
+    print(f"[EI] {sport_up} {event_id} len={len(series)} min={s_min} max={s_max} EI={ei:.3f}", flush=True)
 
-    # Reject placeholder WP series
+    # If EI looks like placeholder, wait and retry next loop
     if ei < 0.02:
         print(f"[WAIT] EI too small (likely placeholder WP). Will retry {event_id}.", flush=True)
         return False
 
-    # Score + vibe -------------- FIX IS HERE: pass sport_up --------------
+    # Score + vibe
     scored = score_game(sport_up, ei)
     score_val = scored.score
     vibe = pick_vibe(score_val)
 
     text = format_post_text(sport_up, game, score_val, vibe)
 
-    print(text)
-    print("-" * 40)
+    print(text, flush=True)
+    print("-" * 40, flush=True)
 
-    # Post to X (if tokens present)
-    ok = post_to_x(text)
-    if not ok:
-        print(f"[X] post failed for {event_id}", flush=True)
-        return False
+    # Try to tweet; only mark as posted on success
+    if post_to_x(text):
+        print(f"[POSTED] {event_id} ({sport_up})", flush=True)
+        posted_ids.add(event_id)
+        save_ledger(posted_ids)
+        return True
 
-    print(f"[POSTED] {event_id} ({sport_up})", flush=True)
-    posted_ids.add(event_id)
-    save_ledger(posted_ids)
-    return True
-
+    print(f"[X] post failed for {event_id}", flush=True)
+    return False
 
 # ----------- Main Loop ----------- #
 
 def run():
+    print("[RUN] Cloud worker started. Polling every 60s.", flush=True)
     while True:
         now = datetime.datetime.utcnow()
         d0 = (now - datetime.timedelta(days=1)).strftime("%Y%m%d")
@@ -168,14 +159,10 @@ def run():
                         print(f"[SKIP] already posted {event_id}", flush=True)
                         continue
 
-                    # Attempt post
-                    posted = post_once(sport_lower, event_id, comp_id, g)
-                    if not posted:
-                        # allow retry next loop
-                        pass
+                    _ = post_once(sport_lower, event_id, comp_id, g)
+                    # if False, we just retry next loop
 
         time.sleep(60)
-
 
 if __name__ == "__main__":
     run()
