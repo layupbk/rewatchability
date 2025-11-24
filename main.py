@@ -1,168 +1,168 @@
-import os, time, datetime, json
+import time
+import datetime
 
 from espn_adapter import get_final_like_events, fetch_wp_quick
 from scoring import score_game
 from vibe_tags import pick_vibe
-from publisher_x import post_to_x  # uses OAuth1 v1.1 poster
+from publisher_x import post_to_x
+from formatting import to_weekday_mm_d_yy
+from posting_rules import format_post
+from ledger import (
+    load_ledger,
+    save_ledger,
+    prune_ledger,
+    already_posted,
+    mark_posted,
+)
 
-LEDGER_FILE = "/data/posted_ledger.json"
+SPORTS = ["nba", "nfl", "mlb", "ncaaf", "ncaam"]
 
-# ---------------- Ledger ---------------- #
 
-def load_ledger():
-    try:
-        with open(LEDGER_FILE, "r", encoding="utf-8") as f:
-            ids = json.load(f)
-            print(f"[RUN] ledger ready with {len(ids)} ids", flush=True)
-            return set(ids)
-    except FileNotFoundError:
-        print("[LEDGER] no ledger found; starting fresh", flush=True)
-        return set()
-    except Exception as e:
-        print(f"[LEDGER] load error: {e}; starting empty", flush=True)
-        return set()
-
-def save_ledger(ids: set[str]):
-    try:
-        with open(LEDGER_FILE, "w", encoding="utf-8") as f:
-            json.dump(sorted(list(ids)), f)
-        print(f"[LEDGER] saved {len(ids)} ids to {LEDGER_FILE}", flush=True)
-    except Exception as e:
-        print(f"[LEDGER] save error: {e}", flush=True)
-
-posted_ids = load_ledger()
-
-# ----------- EI Logic ----------- #
+# ---------------- EI / scoring helpers ---------------- #
 
 def calc_ei_from_home_series(series_raw):
     """
-    EI = Σ|Δ homeWP|
-    - Accepts 0..1 or 0..100.
-    - Drops bad values.
-    - Auto-converts percents to decimals.
+    Convert a raw home-win-probability series into Excitement Index (EI).
+    EI = Σ |ΔWP| where WP is in [0,1].
     """
     if not series_raw or len(series_raw) < 2:
         return 0.0
 
-    clean = []
-    for v in series_raw:
+    series = []
+    for p in series_raw:
         try:
-            f = float(v)
-            if f == f:  # not NaN
-                clean.append(f)
-        except Exception:
-            pass
+            val = float(p)
+        except (TypeError, ValueError):
+            continue
 
-    if len(clean) < 2:
+        # Normalize 0–100 -> 0–1 if needed
+        if val > 1.0:
+            val /= 100.0
+
+        # Clamp to [0,1]
+        if val < 0.0:
+            val = 0.0
+        if val > 1.0:
+            val = 1.0
+
+        series.append(val)
+
+    if len(series) < 2:
         return 0.0
 
-    if max(clean) > 1.5:  # looks like percent points
-        clean = [x / 100.0 for x in clean]
+    diffs = [abs(series[i] - series[i - 1]) for i in range(1, len(series))]
+    return float(sum(diffs))
 
-    total = 0.0
-    prev = clean[0]
-    for p in clean[1:]:
-        total += abs(p - prev)
-        prev = p
-    return total
 
-# ----------- Formatting ----------- #
+def _scoring_key_for_sport(sport_lower: str) -> str:
+    """
+    Map ESPN sport keys into scoring.py keys.
+    """
+    s = sport_lower.lower()
+    if s == "ncaam":
+        return "NCAAB"   # scoring.py expects NCAAB for college hoops
+    if s == "ncaaf":
+        return "NCAAF"
+    return s.upper()     # NBA, NFL, MLB
 
-def sport_emoji(s_up: str) -> str:
-    return "🏀" if s_up == "NBA" else "🏈" if s_up == "NFL" else "⚾"
 
-def date_line_now() -> str:
-    # Weekday + mm/dd/yy; Windows can't use %-m so we strip leading zero
-    now = datetime.datetime.now()
-    if os.name == "nt":
-        return now.strftime("%a") + " · " + now.strftime("%m/%d/%y").lstrip("0").replace("/0", "/")
-    return now.strftime("%a") + " · " + now.strftime("%-m/%-d/%y")
+def _date_line_from_iso(date_iso: str) -> str:
+    try:
+        return to_weekday_mm_d_yy(date_iso)
+    except Exception:
+        return date_iso
 
-def format_post_text(s_up: str, game: dict, score_val: int, vibe: str) -> str:
-    emoji = sport_emoji(s_up)
-    matchup = f"{emoji} {game['away']} @ {game['home']}"
-    net = f" — {game['broadcast']}" if game.get("broadcast") else ""
-    return (
-        f"{matchup}{net} — FINAL\n"
-        f"Rewatchability Score™: {score_val}\n"
-        f"{vibe}\n"
-        f"{date_line_now()}"
-    )
 
-# ----------- Posting Flow ----------- #
+# ---------------- Single-game posting flow ---------------- #
 
-def post_once(sport_lower: str, event_id: str, comp_id: str | None, game: dict) -> bool:
-    # Normalize sport for scoring/vibes
+def post_once(sport_lower: str, event_id: str, comp_id, game: dict, date_iso: str, ledger: dict) -> bool:
     sport_up = sport_lower.upper()
+    print(f"[GAME] {sport_up} {event_id} — fetching WP", flush=True)
 
-    # Try to get WP quickly (adapter includes small internal retries)
     series = fetch_wp_quick(sport_lower, event_id, comp_id)
     if not series:
-        print(f"[WAIT] no WP yet {event_id}", flush=True)
+        print(f"[WP] no series for {event_id}", flush=True)
         return False
-
-    # Debug WP stats
-    try:
-        s_min, s_max = min(series), max(series)
-    except Exception:
-        s_min = s_max = None
 
     ei = calc_ei_from_home_series(series)
-    print(f"[EI] {sport_up} {event_id} len={len(series)} min={s_min} max={s_max} EI={ei:.3f}", flush=True)
-
-    # If EI looks like placeholder, wait and retry next loop
-    if ei < 0.02:
-        print(f"[WAIT] EI too small (likely placeholder WP). Will retry {event_id}.", flush=True)
+    if ei <= 0.0:
+        print(f"[EI] zero or invalid EI for {event_id}", flush=True)
         return False
 
-    # Score + vibe
-    scored = score_game(sport_up, ei)
+    score_key = _scoring_key_for_sport(sport_lower)
+    scored = score_game(score_key, ei)
     score_val = scored.score
     vibe = pick_vibe(score_val)
 
-    text = format_post_text(sport_up, game, score_val, vibe)
+    date_line = _date_line_from_iso(date_iso)
+    network = (game.get("broadcast") or "").strip() or "Streaming / Local"
+
+    # Unified formatting (X/Threads style)
+    text = format_post(
+        game=game,
+        score=score_val,
+        vibe=vibe,
+        date=date_line,
+        sport=sport_up,
+        neutral_site=False,  # can be wired later if needed
+        network=network,
+    )
 
     print(text, flush=True)
     print("-" * 40, flush=True)
 
-    # Try to tweet; only mark as posted on success
+    # This now calls the NO-OP stub in publisher_x.py
     if post_to_x(text):
         print(f"[POSTED] {event_id} ({sport_up})", flush=True)
-        posted_ids.add(event_id)
-        save_ledger(posted_ids)
+        mark_posted(ledger, event_id)
+        save_ledger(ledger)
         return True
 
-    print(f"[X] post failed for {event_id}", flush=True)
+    print(f"[FAIL] X post failed for {event_id}", flush=True)
     return False
 
-# ----------- Main Loop ----------- #
+
+# ---------------- Main autopilot loop ---------------- #
+
+def _date_range_to_poll(now_utc: datetime.datetime) -> list[str]:
+    today = now_utc.date()
+    yesterday = today - datetime.timedelta(days=1)
+    return [yesterday.isoformat(), today.isoformat()]
 
 def run():
-    print("[RUN] Cloud worker started. Polling every 60s.", flush=True)
+    print("[RUN] starting Rewatchability autopilot", flush=True)
+    ledger = load_ledger()
+    prune_ledger(ledger)
+
     while True:
-        now = datetime.datetime.utcnow()
-        d0 = (now - datetime.timedelta(days=1)).strftime("%Y%m%d")
-        d1 = now.strftime("%Y%m%d")
+        now_utc = datetime.datetime.utcnow()
+        dates = _date_range_to_poll(now_utc)
 
-        print(f"[HB] checking dates: {d0} and {d1}", flush=True)
+        prune_ledger(ledger)
 
-        for sport_lower in ["nba", "nfl", "mlb"]:
-            for date in [d0, d1]:
-                games = get_final_like_events(sport_lower, date)
-                print(f"[INFO] {date} FINAL-like events found: {len(games)}", flush=True)
+        for sport_lower in SPORTS:
+            sport_up = sport_lower.upper()
+            print(f"[LOOP] checking {sport_up}", flush=True)
+
+            for date_iso in dates:
+                games = get_final_like_events(sport_lower, date_iso)
+                if not games:
+                    continue
+
+                print(f"[FOUND] {len(games)} final-like {sport_up} games on {date_iso}", flush=True)
 
                 for g in games:
                     event_id = g["id"]
                     comp_id = g.get("competition_id")
 
-                    if event_id in posted_ids:
+                    if already_posted(ledger, event_id):
                         print(f"[SKIP] already posted {event_id}", flush=True)
                         continue
 
-                    _ = post_once(sport_lower, event_id, comp_id, g)
-                    # if False, we just retry next loop
+                    post_once(sport_lower, event_id, comp_id, g, date_iso, ledger)
 
         time.sleep(60)
+
 
 if __name__ == "__main__":
     run()

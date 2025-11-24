@@ -3,55 +3,78 @@ import re
 # ------------- helpers -------------
 
 def sport_emoji(sport: str) -> str:
+    """
+    Emoji used in headline line for posts/captions.
+    If the sport is unrecognized, return no emoji.
+    """
     s = sport.upper()
-    if s in ("NBA", "NCAAM"):
+    if s in ("NBA", "NCAAM", "NCAAB", "CBB"):
         return "🏀"
-    if s in ("NFL", "NCAAF"):
+    if s in ("NFL", "NCAAF", "CFB"):
         return "🏈"
     if s == "MLB":
         return "⚾"
     return ""
 
+
 def clean_hashtag_text(text: str) -> str:
     """Keep letters/numbers only; no spaces/punct; title-casing not required for hashtags."""
     return re.sub(r"[^A-Za-z0-9]", "", text.strip())
 
+
 def league_hashtag(sport: str) -> str:
-    """Force league hashtag names; college uses NCAAF/NCAAM."""
+    """
+    Normalize multiple internal keys to a small, consistent set of public tags:
+      - NBA         -> #NBA
+      - NFL         -> #NFL
+      - MLB         -> #MLB
+      - NCAAF / CFB -> #NCAAF
+      - NCAAM / NCAAB / CBB -> #NCAAM  (men's college basketball)
+    """
+    s = sport.upper()
     mapping = {
         "NBA": "NBA",
         "NFL": "NFL",
         "MLB": "MLB",
         "NCAAF": "NCAAF",
+        "CFB": "NCAAF",
         "NCAAM": "NCAAM",
+        "NCAAB": "NCAAM",
+        "CBB": "NCAAM",
     }
-    tag = mapping.get(sport.upper(), sport.upper())
+    tag = mapping.get(s, s)
     return f"#{tag}"
 
-def event_hashtag(event_name: str | None) -> str | None:
-    """
-    Convert an event/tournament name to a hashtag if provided.
-    Examples:
-      'Champions Classic' -> '#ChampionsClassic'
-      'Maui Invitational' -> '#MauiInvitational'
-      'Red River Rivalry' -> '#RedRiverRivalry'
-    """
-    if not event_name:
-        return None
-    cleaned = clean_hashtag_text(event_name)
-    return f"#{cleaned}" if cleaned else None
 
 # ------------- public formatting -------------
 
-def format_post(game, score, vibe, date, sport, neutral_site=False, network=None):
+def format_post(
+    game,
+    score: int,
+    vibe: str,
+    date: str,
+    sport: str,
+    neutral_site: bool = False,
+    network: str | None = None,
+) -> str:
     """
-    Tweet text (no hashtags). `date` is already formatted (e.g., 'Tue · 11/4/25').
-    Shows broadcaster in the headline if national; never hashtags broadcaster.
+    Core text post format, used for:
+      - X (Twitter)
+      - Threads
+      - Any other plain-text contexts
+
+    `date` is already formatted (e.g., 'Tue · 11/4/25').
+
+    Uses SHORT team names everywhere if available:
+      game['away_short'] / game['home_short'] preferred over game['away'] / game['home'].
     """
     emoji = sport_emoji(sport)
+    away_name = (game.get("away_short") or game.get("away") or "").strip()
+    home_name = (game.get("home_short") or game.get("home") or "").strip()
+
     sep = "vs." if neutral_site else "@"
 
-    line1 = f"{emoji} {game['away']} {sep} {game['home']}"
+    line1 = f"{emoji} {away_name} {sep} {home_name}".strip()
     if network:
         line1 += f" — {network}"
     line1 += " — FINAL"
@@ -62,30 +85,43 @@ Rewatchability Score™: {score}
 {date}
 """
 
-def format_video_caption(game, score, vibe, date, sport,
-                         neutral_site=False, network=None,
-                         is_national=True, event_name: str | None = None):
-    """
-    Video caption (same text block as tweet, plus hashtags).
 
-    Hashtags:
-      1) #RewatchabilityScore
-      2) #<League>      (NBA/NFL/MLB/NCAAF/NCAAM)
-      3) #<AwayTeam>    (spaces/punct removed)
-      4) #<HomeTeam>    (spaces/punct removed)
-      5) #<EventName>   (IF special event/tournament exists)
+def format_video_caption(
+    game,
+    score: int,
+    vibe: str,
+    date: str,
+    sport: str,
+    neutral_site: bool = False,
+    network: str | None = None,
+) -> str:
+    """
+    Short-form video caption format, used for:
+      - TikTok
+      - Instagram Reels
+      - Facebook Reels
+      - YouTube Shorts
+      - etc.
+
+    Structure:
+      - Same core text as format_post(...)
+      - Plus hashtags:
+
+        1) #RewatchabilityScore
+        2) #<League>      (NBA/NFL/MLB/NCAAF/NCAAM)
+        3) #<AwayShort>   (short team name, letters/numbers only)
+        4) #<HomeShort>   (short team name, letters/numbers only)
     """
     text = format_post(game, score, vibe, date, sport, neutral_site, network)
+
+    away_name = (game.get("away_short") or game.get("away") or "").strip()
+    home_name = (game.get("home_short") or game.get("home") or "").strip()
 
     tags = [
         "#RewatchabilityScore",
         league_hashtag(sport),
-        f"#{clean_hashtag_text(game['away'])}",
-        f"#{clean_hashtag_text(game['home'])}",
+        f"#{clean_hashtag_text(away_name)}",
+        f"#{clean_hashtag_text(home_name)}",
     ]
-
-    evt = event_hashtag(event_name)
-    if evt:
-        tags.append(evt)
 
     return text.rstrip() + "\n\n" + " ".join(tags)
