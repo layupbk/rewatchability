@@ -1,3 +1,4 @@
+import os
 import time
 import datetime
 
@@ -17,13 +18,27 @@ from ledger import (
 
 SPORTS = ["nba", "nfl", "mlb", "ncaaf", "ncaam"]
 
+# --------------------------------------------------
+# Tuning knobs (via environment variables)
+# --------------------------------------------------
+
+# EI scaling: ESPN's raw EI is coming in hotter than our calibration.
+# We shrink it before feeding into scoring.py so we don't get 100s for everything.
+EI_SCALE = float(os.getenv("ESPN_EI_SCALE", "0.25"))
+
+# Minimum score to actually post a game. Everything below is skipped.
+MIN_POST_SCORE = int(os.getenv("MIN_POST_SCORE", "90"))
+
 
 # ---------------- EI / scoring helpers ---------------- #
 
 def calc_ei_from_home_series(series_raw):
     """
     Convert a raw home-win-probability series into Excitement Index (EI).
-    EI = Σ |ΔWP| where WP is in [0,1].
+
+    EI_raw = Σ |ΔWP| where WP is in [0,1].
+    Then we apply a global scaling factor (EI_SCALE) to bring ESPN's
+    numbers onto the calibrated range used in scoring.py.
     """
     if not series_raw or len(series_raw) < 2:
         return 0.0
@@ -51,7 +66,11 @@ def calc_ei_from_home_series(series_raw):
         return 0.0
 
     diffs = [abs(series[i] - series[i - 1]) for i in range(1, len(series))]
-    return float(sum(diffs))
+    ei_raw = float(sum(diffs))
+
+    # Shrink to better match our calibrated EI range.
+    ei_scaled = ei_raw * EI_SCALE
+    return ei_scaled
 
 
 def _scoring_key_for_sport(sport_lower: str) -> str:
@@ -92,6 +111,12 @@ def post_once(sport_lower: str, event_id: str, comp_id, game: dict, date_iso: st
     score_key = _scoring_key_for_sport(sport_lower)
     scored = score_game(score_key, ei)
     score_val = scored.score
+
+    # NEW: Don't post low/medium games – only strong ones.
+    if score_val < MIN_POST_SCORE:
+        print(f"[SKIP] score {score_val} < MIN_POST_SCORE={MIN_POST_SCORE} for {event_id}", flush=True)
+        return False
+
     vibe = pick_vibe(score_val)
 
     date_line = _date_line_from_iso(date_iso)
@@ -135,7 +160,8 @@ def run():
     prune_ledger(ledger)
 
     while True:
-        now_utc = datetime.datetime.utcnow()
+        # Use timezone-aware UTC to avoid deprecation warning
+        now_utc = datetime.datetime.now(datetime.timezone.utc)
         dates = _date_range_to_poll(now_utc)
 
         prune_ledger(ledger)
