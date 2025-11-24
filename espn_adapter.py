@@ -1,5 +1,5 @@
 # espn_adapter.py
-# Full + Debug version
+# Full + Debug version (UPDATED 2025-11-24)
 # Robust ESPN scoreboard + WP fetch with fallbacks and clear logs.
 # Works for NBA, NFL, MLB, NCAAF, NCAAM.
 
@@ -51,7 +51,7 @@ def _get(url: str, params: dict | None = None) -> dict | None:
     try:
         r = requests.get(url, headers=HEADERS, params=params, timeout=TIMEOUT)
         if not r.ok:
-            _log(f"[DEBUG] GET {url} -> {r.status_code}")
+            _log(f"[DEBUG] GET {url} params={params} -> {r.status_code}")
             return None
         return r.json()
     except Exception as e:
@@ -59,16 +59,24 @@ def _get(url: str, params: dict | None = None) -> dict | None:
         return None
 
 
-def _scoreboard_urls(sport_key: str, date_iso: str) -> list[str]:
+# -----------------------------
+# URL builders
+# -----------------------------
+def _scoreboard_urls(sport_key: str) -> list[str]:
     """
     Return a list of candidate scoreboard endpoints to try, new to old.
+    We keep the list host-only; query params are added by list_final_events_for_date.
     """
     sport, league = LEAGUE_PATH[sport_key]
 
     urls: list[str] = [
+        # Core / CDN style endpoints
+        f"https://sports.core.api.espn.com/v2/sports/{sport}/{league}/scoreboard",
+        f"https://cdn.espn.com/core/{league}/scoreboard",
+
+        # Legacy v2 JSON endpoints
         f"https://site.web.api.espn.com/apis/v2/sports/{sport}/{league}/scoreboard",
         f"https://site.api.espn.com/apis/v2/sports/{sport}/{league}/scoreboard",
-        f"https://sportscenter.api.espn.com/apis/v1/events",
     ]
     return urls
 
@@ -202,22 +210,36 @@ def _parse_event(league_key: str, comp: dict, e: dict) -> dict | None:
 def list_final_events_for_date(date_iso: str, leagues: list[str]) -> list[dict]:
     """
     Return normalized events for leagues that look 'final-like' on date (YYYY-MM-DD).
+    Tries multiple hosts and both YYYY-MM-DD and YYYYMMDD date formats.
     """
     out: list[dict] = []
+
+    # Normalize date strings for params
+    iso_dash = date_iso.strip()
+    iso_compact = iso_dash.replace("-", "")
 
     for league in leagues:
         if league not in LEAGUE_PATH:
             continue
 
-        urls = _scoreboard_urls(league, date_iso)
+        urls = _scoreboard_urls(league)
         data = None
+
         for u in urls:
-            params = {"dates": date_iso} if "scoreboard" in u else None
+            # First try with YYYY-MM-DD
+            params = {"dates": iso_dash}
             data = _get(u, params=params)
+            if not data:
+                # Fallback: some endpoints prefer YYYYMMDD
+                params = {"dates": iso_compact}
+                data = _get(u, params=params)
+
             if data:
+                _log(f"[INFO] scoreboard OK for {league} on {iso_dash} via {u}")
                 break
+
         if not data:
-            _log(f"[WARN] no scoreboard data for {league} on {date_iso}")
+            _log(f"[WARN] no scoreboard data for {league} on {iso_dash}")
             continue
 
         events = data.get("events") or []
@@ -232,7 +254,7 @@ def list_final_events_for_date(date_iso: str, leagues: list[str]) -> list[dict]:
             if parsed["completed"]:
                 out.append(parsed)
 
-    _log(f"[INFO] {date_iso} FINAL-like events found: {len(out)}")
+    _log(f"[INFO] {iso_dash} FINAL-like events found: {len(out)}")
     return out
 
 
