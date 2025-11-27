@@ -15,9 +15,14 @@ class ScoreResult:
 # ======================================================================
 # COMMON NOTES
 # ======================================================================
-# EI (Excitement Index) is defined as:
+# EI (Excitement Index) baseline is defined as:
 #   EI = Σ |ΔWP|
 # where WP is win probability on a 0..1 scale per step.
+#
+# In this module, `E` always refers to the *calibrated* EI axis used
+# in the v1 constants PDF (the same value returned as `ei_scaled`
+# from `calc_ei_from_home_series` in main.py, i.e. Σ|ΔWP| multiplied
+# by EI_SCALE). It is **not** the raw unscaled sum.
 #
 # All sports share the same 40–100 piecewise shape:
 #   - EI ≤ E_MIN           → Score = 40
@@ -206,7 +211,9 @@ def score_game(sport: str, ei: float) -> ScoreResult:
     """
     sport: 'NBA' | 'NFL' | 'MLB' | 'NCAAF' | 'NCAAB'
            (case-insensitive; we normalize to UPPER)
-    ei   : Excitement Index (Σ |ΔWP|) on the raw ESPN scale.
+    ei   : Excitement Index on the calibrated E axis used in the v1
+           constants PDF (the same `ei_scaled` value produced by
+           calc_ei_from_home_series in main.py, i.e. Σ|ΔWP| * EI_SCALE).
     """
     key = sport.upper().strip()
     E = float(ei)
