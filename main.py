@@ -29,22 +29,23 @@ EI_SCALE = float(os.getenv("ESPN_EI_SCALE", "0.01"))
 
 
 # -----------------------------
-# EI computation
+# EI computation helper
 # -----------------------------
 def calc_ei_from_home_series(series_raw: list[float]) -> tuple[float, float]:
     """
-    Given a raw home-team WP series (0..1 floats), compute:
+    Given a list of home win probabilities (0.0–1.0),
+    compute the Excitement Index (EI).
 
-        - ei_raw:   Σ |ΔWP|
-        - ei_scaled: ei_raw * EI_SCALE, which is what we pass into scoring.py
+    Returns:
+      (ei_scaled, ei_raw)
 
-    If the series is too short or malformed, returns (0.0, 0.0).
+    Where:
+      - ei_raw = sum(|ΔWP|)
+      - ei_scaled = ei_raw * EI_SCALE, which is what we pass into scoring.py
+        (and what the historical EI CSVs are based on).
     """
-    if not series_raw or len(series_raw) < 2:
-        return 0.0, 0.0
-
-    # Defensive copy + sanitize
     series: list[float] = []
+
     for val in series_raw:
         # Some ESPN feeds may be 0–100; normalize those.
         if val > 1.0:
@@ -65,64 +66,56 @@ def calc_ei_from_home_series(series_raw: list[float]) -> tuple[float, float]:
     return ei_scaled, ei_raw
 
 
-# -----------------------------
-# Formatting helpers
-# -----------------------------
-def _teams_line(game: dict) -> str:
+def _scoring_key_for_sport(sport_lower: str) -> str:
     """
-    Build a human-readable matchup string like:
-
-        "Pistons @ Celtics — ESPN — FINAL"
-
-    The broadcasting network is handled later; here we only assemble teams.
+    Map ESPN sport keys into scoring.py keys.
     """
-    away = game.get("away") or {}
-    home = game.get("home") or {}
-
-    away_name = away.get("name") or away.get("abbrev") or "Away"
-    home_name = home.get("name") or home.get("abbrev") or "Home"
-
-    # Use scores if present
-    away_score = away.get("score")
-    home_score = home.get("score")
-
-    if away_score is not None and home_score is not None:
-        return f"{away_name} {away_score} @ {home_name} {home_score}"
-
-    return f"{away_name} @ {home_name}"
+    s = sport_lower.lower()
+    if s == "ncaam":
+        return "ncaab"  # scoring uses "ncaab"
+    return s
 
 
 def _date_line_from_iso(date_iso: str) -> str:
     """
-    Convert an ISO date (YYYY-MM-DD) into a nice human-readable line like:
-
-        "Wed · 11/26/25"
+    Turn 'YYYY-MM-DD' into the pretty line used in the post copy,
+    e.g. "Wednesday 11/26/25".
     """
     return to_weekday_mm_d_yy(date_iso)
 
 
+# -----------------------------
+# Core per-game compute + text
+# -----------------------------
 def _compute_game_text(
     sport_lower: str,
     event_id: str,
     comp_id,
     game: dict,
     date_iso: str,
-) -> tuple[int | None, str]:
+) -> tuple[int | None, str | None]:
     """
     Fetch WP, compute EI & score, and build the final post text string.
+
+    Returns:
+      (score_val, text) on success, or (None, None) if something went wrong.
     """
     sport_up = sport_lower.upper()
+    print(f"[GAME] {sport_up} {event_id} — fetching WP", flush=True)
 
-    # Fetch WP series for this event; ESPN uses the event id for summary.
-    series = fetch_wp_quick(sport_up, event_id)
+    # NOTE: fetch_wp_quick requires competition_id as well.
+    series = fetch_wp_quick(sport_lower, event_id, comp_id)
     if not series:
-        print(f"[WARN] no WP series for {sport_up} {event_id}", flush=True)
-        return None, ""
+        print(f"[WARN] no WP data for {event_id}, skipping.", flush=True)
+        return None, None
 
     ei_scaled, ei_raw = calc_ei_from_home_series(series)
-    result = score_game(sport_up, ei_scaled)
-    score_val = result.score
 
+    scoring_key = _scoring_key_for_sport(sport_lower)
+    scored = score_game(scoring_key, ei_scaled)
+    score_val = scored.score
+
+    # Debug line so we can see how things look:
     print(
         f"[EI] {sport_up} {event_id} raw={ei_raw:.3f} "
         f"scaled={ei_scaled:.3f} score={score_val}",
@@ -236,7 +229,7 @@ def run():
             print(f"[LOOP] checking {sport_up}", flush=True)
 
             for date_iso in dates:
-                games = get_final_like_events(sport_up, date_iso)
+                games = get_final_like_events(sport_lower, date_iso)
                 if not games:
                     print(
                         f"[INFO] {date_iso} FINAL-like events found: 0",
