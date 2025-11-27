@@ -5,7 +5,6 @@
 from __future__ import annotations
 from dataclasses import dataclass
 
-
 @dataclass
 class ScoreResult:
     score: int
@@ -16,22 +15,31 @@ class ScoreResult:
 # ======================================================================
 # COMMON NOTES
 # ======================================================================
+# EI (Excitement Index) is defined as:
+#   EI = Σ |ΔWP|
+# where WP is win probability on a 0..1 scale per step.
 #
-# - All sports share the same piecewise shape:
-#     EI ≤ E_MIN        -> 40
-#     E_MIN → E_MED     -> 40 → 70
-#     E_MED → E_90      -> 70 → 90
-#     E_90 → E_99       -> 90 → 99
-#     E_99 → E_MAX      -> 99 → 100
-#     EI > E_MAX        -> 100
+# All sports share the same 40–100 piecewise shape:
+#   - EI ≤ E_MIN           → Score = 40
+#   - E_MIN < EI ≤ E_MED   → 40 → 70   (linear)
+#   - E_MED < EI ≤ E_90    → 70 → 90   (linear)
+#   - E_90  < EI ≤ E_99    → 90 → 99   (linear)
+#   - E_99  < EI ≤ E_MAX   → 99 → 100  (linear)
+#   - EI ≥ E_MAX           → Score = 100
 #
-# - Scores are clamped to [40, 100] and rounded to nearest int.
-# - EI values passed into these functions are already scaled
-#   upstream (via EI_SCALE in main.py).
-
+# Scores are clamped to [40, 100] and rounded to the nearest int.
+# The only thing that changes by sport is the set of EI anchors:
+#   E_MIN, E_MED, E_90, E_99, E_MAX
+#
+# All anchors below are calibrated from your EI datasets and lock in the
+# global rarity standard:
+#   - 90+  ≈ 14.5 games per season
+#   - 95+  ≈  5.8 games per season
+#   - 99+  ≈  2.6 games per season
+# across each league.
 
 # ======================================================================
-# NBA V1
+# NBA V1 (piecewise, 2017–18, 2018–19, 2021–22, 2022–23, 2023–24, 2024–25)
 # ======================================================================
 
 NBA_E_MIN = 0.00536
@@ -50,12 +58,11 @@ def _score_nba(e: float) -> int:
     elif E <= NBA_E_90:
         s = 70.0 + 20.0 * (E - NBA_E_MED) / (NBA_E_90 - NBA_E_MED)
     elif E <= NBA_E_99:
-        s = 90.0 + 9.0 * (E - NBA_E_90) / (NBA_E_99 - NBA_E_90)
+        s = 90.0 + 9.0  * (E - NBA_E_90) / (NBA_E_99 - NBA_E_90)
     elif E <= NBA_E_MAX:
-        s = 99.0 + 1.0 * (E - NBA_E_99) / (NBA_E_MAX - NBA_E_99)
+        s = 99.0 + 1.0  * (E - NBA_E_99) / (NBA_E_MAX - NBA_E_99)
     else:
         s = 100.0
-
     if s < 40.0:
         s = 40.0
     if s > 100.0:
@@ -64,7 +71,7 @@ def _score_nba(e: float) -> int:
 
 
 # ======================================================================
-# NFL V1
+# NFL V1 (piecewise, REG only, 2016–2019 & 2021–24)
 # ======================================================================
 
 NFL_E_MIN = 0.00984
@@ -83,12 +90,11 @@ def _score_nfl(e: float) -> int:
     elif E <= NFL_E_90:
         s = 70.0 + 20.0 * (E - NFL_E_MED) / (NFL_E_90 - NFL_E_MED)
     elif E <= NFL_E_99:
-        s = 90.0 + 9.0 * (E - NFL_E_90) / (NFL_E_99 - NFL_E_90)
+        s = 90.0 + 9.0  * (E - NFL_E_90) / (NFL_E_99 - NFL_E_90)
     elif E <= NFL_E_MAX:
-        s = 99.0 + 1.0 * (E - NFL_E_99) / (NFL_E_MAX - NFL_E_99)
+        s = 99.0 + 1.0  * (E - NFL_E_99) / (NFL_E_MAX - NFL_E_99)
     else:
         s = 100.0
-
     if s < 40.0:
         s = 40.0
     if s > 100.0:
@@ -97,7 +103,7 @@ def _score_nfl(e: float) -> int:
 
 
 # ======================================================================
-# MLB V1
+# MLB V1 (piecewise, REG only, 2016–2019 & 2021–25)
 # ======================================================================
 
 MLB_E_MIN = 0.00326
@@ -116,12 +122,11 @@ def _score_mlb(e: float) -> int:
     elif E <= MLB_E_90:
         s = 70.0 + 20.0 * (E - MLB_E_MED) / (MLB_E_90 - MLB_E_MED)
     elif E <= MLB_E_99:
-        s = 90.0 + 9.0 * (E - MLB_E_90) / (MLB_E_99 - MLB_E_90)
+        s = 90.0 + 9.0  * (E - MLB_E_90) / (MLB_E_99 - MLB_E_90)
     elif E <= MLB_E_MAX:
-        s = 99.0 + 1.0 * (E - MLB_E_99) / (MLB_E_MAX - MLB_E_99)
+        s = 99.0 + 1.0  * (E - MLB_E_99) / (MLB_E_MAX - MLB_E_99)
     else:
         s = 100.0
-
     if s < 40.0:
         s = 40.0
     if s > 100.0:
@@ -149,12 +154,11 @@ def _score_ncaaf(e: float) -> int:
     elif E <= NCAAF_E_90:
         s = 70.0 + 20.0 * (E - NCAAF_E_MED) / (NCAAF_E_90 - NCAAF_E_MED)
     elif E <= NCAAF_E_99:
-        s = 90.0 + 9.0 * (E - NCAAF_E_90) / (NCAAF_E_99 - NCAAF_E_90)
+        s = 90.0 + 9.0  * (E - NCAAF_E_90) / (NCAAF_E_99 - NCAAF_E_90)
     elif E <= NCAAF_E_MAX:
-        s = 99.0 + 1.0 * (E - NCAAF_E_99) / (NCAAF_E_MAX - NCAAF_E_99)
+        s = 99.0 + 1.0  * (E - NCAAF_E_99) / (NCAAF_E_MAX - NCAAF_E_99)
     else:
         s = 100.0
-
     if s < 40.0:
         s = 40.0
     if s > 100.0:
@@ -163,7 +167,7 @@ def _score_ncaaf(e: float) -> int:
 
 
 # ======================================================================
-# NCAAB V1 (Men's College Basketball)
+# NCAAB V1 (College Basketball)
 # ======================================================================
 
 NCAAB_E_MIN = 0.00002
@@ -182,12 +186,11 @@ def _score_ncaab(e: float) -> int:
     elif E <= NCAAB_E_90:
         s = 70.0 + 20.0 * (E - NCAAB_E_MED) / (NCAAB_E_90 - NCAAB_E_MED)
     elif E <= NCAAB_E_99:
-        s = 90.0 + 9.0 * (E - NCAAB_E_90) / (NCAAB_E_99 - NCAAB_E_90)
+        s = 90.0 + 9.0  * (E - NCAAB_E_90) / (NCAAB_E_99 - NCAAB_E_90)
     elif E <= NCAAB_E_MAX:
-        s = 99.0 + 1.0 * (E - NCAAB_E_99) / (NCAAB_E_MAX - NCAAB_E_99)
+        s = 99.0 + 1.0  * (E - NCAAB_E_99) / (NCAAB_E_MAX - NCAAB_E_99)
     else:
         s = 100.0
-
     if s < 40.0:
         s = 40.0
     if s > 100.0:
@@ -196,23 +199,17 @@ def _score_ncaab(e: float) -> int:
 
 
 # ======================================================================
-# MAIN DISPATCH
+# Public entrypoint
 # ======================================================================
 
-def score_game(sport: str, ei_raw: float, *, scale: float = 1.0) -> ScoreResult:
+def score_game(sport: str, ei: float) -> ScoreResult:
     """
-    Main entrypoint used by main.py.
-
-    Args:
-      sport: one of "NBA", "NFL", "MLB", "NCAAF", "NCAAB"
-      ei_raw: scaled EI value (already multiplied by EI_SCALE in main.py)
-      scale: optional extra scaling factor (usually 1.0)
-
-    Returns:
-      ScoreResult(score=int, sport=str, ei=float)
+    sport: 'NBA' | 'NFL' | 'MLB' | 'NCAAF' | 'NCAAB'
+           (case-insensitive; we normalize to UPPER)
+    ei   : Excitement Index (Σ |ΔWP|) on the raw ESPN scale.
     """
-    key = sport.upper()
-    E = float(ei_raw) * float(scale)
+    key = sport.upper().strip()
+    E = float(ei)
 
     if key == "NBA":
         s = _score_nba(E)
@@ -222,7 +219,7 @@ def score_game(sport: str, ei_raw: float, *, scale: float = 1.0) -> ScoreResult:
         s = _score_mlb(E)
     elif key in ("NCAAF", "CFB"):
         s = _score_ncaaf(E)
-    elif key in ("NCAAB", "CBB"):
+    elif key in ("NCAAB", "CBB", "NCAAM"):
         s = _score_ncaab(E)
     else:
         # Unknown sport: return safe floor so we don't publish junk
