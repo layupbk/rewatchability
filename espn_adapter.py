@@ -15,20 +15,9 @@ from typing import Final
 DEBUG: bool = os.getenv("DEBUG_ESPN", "1").lower() not in ("0", "false", "no")
 TIMEOUT: float = float(os.getenv("ESPN_TIMEOUT", "8.0"))
 
-USER_AGENT: str = os.getenv(
-    "ESPN_UA",
-    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
-    "(KHTML, like Gecko) Chrome/124.0 Safari/537.36",
-)
+# NOTE: We only support a small set of sports/leagues that we explicitly
+# calibrate and test for this project.
 
-HEADERS: Final[dict[str, str]] = {
-    "User-Agent": USER_AGENT,
-    "Accept": "application/json, text/plain, */*",
-    "Accept-Language": "en-US,en;q=0.9",
-    "Connection": "keep-alive",
-}
-
-# Supported leagues for scoreboards / summaries
 # key -> (sport_path, league_path)
 LEAGUE_PATH: Final[dict[str, tuple[str, str]]] = {
     "NBA":   ("basketball", "nba"),
@@ -36,6 +25,8 @@ LEAGUE_PATH: Final[dict[str, tuple[str, str]]] = {
     "MLB":   ("baseball",   "mlb"),
     "NCAAF": ("football",   "college-football"),
     "NCAAM": ("basketball", "mens-college-basketball"),
+    "NCAAB": ("basketball", "mens-college-basketball"),  # alias for NCAAM
+    "CBB":   ("basketball", "mens-college-basketball"),  # optional college hoops alias
 }
 
 # Query param name ESPN uses for dates on scoreboard
@@ -55,6 +46,61 @@ def _log(msg: str) -> None:
 
 
 # -----------------------------
+# URL helpers
+# -----------------------------
+def _default_scoreboard_templates() -> list[str]:
+    # Primary: site.api
+    # Secondary: site.web.api (used by some clients)
+    return [
+        "https://site.api.espn.com/apis/site/v2/sports/{sport}/{league}/scoreboard",
+        "https://site.web.api.espn.com/apis/site/v2/sports/{sport}/{league}/scoreboard",
+    ]
+
+
+def _scoreboard_templates() -> list[str]:
+    """
+    List of scoreboard base URLs with {sport} and {league} placeholders.
+
+    Uses env override if ESPN_SCOREBOARD_BASES is set, otherwise falls back
+    to the default pair of site.api + site.web.api.
+    """
+    if SCOREBOARD_TEMPLATES_ENV:
+        templates = []
+        for piece in SCOREBOARD_TEMPLATES_ENV.split(","):
+            tpl = piece.strip()
+            if not tpl:
+                continue
+            if "{sport}" not in tpl or "{league}" not in tpl:
+                continue
+            templates.append(tpl)
+        if templates:
+            return templates
+    return _default_scoreboard_templates()
+
+
+def _scoreboard_urls_for_league(league_key: str) -> list[str]:
+    league_key = league_key.upper()
+    if league_key not in LEAGUE_PATH:
+        return []
+    sport, league = LEAGUE_PATH[league_key]
+    urls = []
+    for tpl in _scoreboard_templates():
+        urls.append(tpl.format(sport=sport, league=league))
+    return urls
+
+
+def _summary_url_for_event(league_key: str, event_id: str) -> str | None:
+    """
+    Build an ESPN "summary" URL for a single event given a league key.
+    """
+    league_key = league_key.upper()
+    if league_key not in LEAGUE_PATH:
+        return None
+    sport, league = LEAGUE_PATH[league_key]
+    return f"https://site.api.espn.com/apis/site/v2/sports/{sport}/{league}/summary"
+
+
+# -----------------------------
 # HTTP helper
 # -----------------------------
 def _get(url: str, params: dict | None = None) -> dict | None:
@@ -70,329 +116,270 @@ def _get(url: str, params: dict | None = None) -> dict | None:
 
 
 # -----------------------------
-# URL builders
+# Scoreboard adapter
 # -----------------------------
-def _scoreboard_templates() -> list[str]:
+
+# Some ESPN sports (notably college football) require a "group" param to
+# scope the scoreboard. We support a minimal set here and can expand later.
+LEAGUE_GROUPS: Final[dict[str, str]] = {
+    # College football top-level "FBS" group
+    "NCAAF": "80",
+}
+
+# Some sports have a limit param that must be set high enough to capture
+# all games on busy days.
+LEAGUE_LIMITS: Final[dict[str, str]] = {
+    "NCAAF": "500",
+}
+
+
+def _scoreboard_params_for_league(league_key: str, date_iso: str) -> dict:
+    league_key = league_key.upper()
+    params: dict[str, str] = {DATE_PARAM: date_iso.replace("-", "")}
+    if league_key in LEAGUE_GROUPS:
+        params["groups"] = LEAGUE_GROUPS[league_key]
+    if league_key in LEAGUE_LIMITS:
+        params["limit"] = LEAGUE_LIMITS[league_key]
+    return params
+
+
+def _extract_competitions(scoreboard: dict) -> list[dict]:
+    events = scoreboard.get("events") or []
+    comps: list[dict] = []
+    for ev in events:
+        for comp in ev.get("competitions") or []:
+            comps.append(comp)
+    return comps
+
+
+def _is_final_like(status: dict) -> bool:
     """
-    List of scoreboard base URLs with {sport} and {league} placeholders.
-
-    If ESPN_SCOREBOARD_BASES env var is set, use that (comma-separated).
-    Otherwise, use known-good defaults based on community docs:
-      https://site.api.espn.com/apis/site/v2/sports/{sport}/{league}/scoreboard
+    Treat "final", "status over", and similar as end-of-game.
     """
-    if SCOREBOARD_TEMPLATES_ENV:
-        tmpls = [t.strip() for t in SCOREBOARD_TEMPLATES_ENV.split(",") if t.strip()]
-        if tmpls:
-            return tmpls
+    if not status:
+        return False
+    type_info = status.get("type") or {}
+    # ESPN uses a numeric id and a name like "STATUS_FINAL".
+    name = (type_info.get("name") or "").upper()
+    description = (type_info.get("description") or "").upper()
+    state = (type_info.get("state") or "").upper()
 
-    # Default templates: primary is site.api; site.web is a fallback.
-    return [
-        "https://site.api.espn.com/apis/site/v2/sports/{sport}/{league}/scoreboard",
-        "https://site.web.api.espn.com/apis/site/v2/sports/{sport}/{league}/scoreboard",
-    ]
+    # Basic check: state is "post"
+    if state == "POST":
+        return True
+
+    # Fallback: look at name/description
+    final_keywords = ("FINAL", "OVERTIME", "AFTER")
+    if any(k in name for k in final_keywords):
+        return True
+    if any(k in description for k in final_keywords):
+        return True
+
+    return False
 
 
-def _scoreboard_urls(league_key: str) -> list[str]:
-    sport, league = LEAGUE_PATH[league_key]
-    return [tmpl.format(sport=sport, league=league) for tmpl in _scoreboard_templates()]
-
-
-def _summary_urls(league_key: str, event_id: str) -> list[str]:
+def _extract_broadcast(comp: dict) -> str:
     """
-    Candidate summary endpoints for win-probability data.
-
-    We try a few variants so that if ESPN tweaks one path, another might still work.
+    Return a best-effort network string. Fallback to empty if not found.
     """
-    sport, league = LEAGUE_PATH[league_key]
-    return [
-        # Common v2 "site" summary with query param ?event=
-        f"https://site.web.api.espn.com/apis/site/v2/sports/{sport}/{league}/summary",
-        f"https://site.api.espn.com/apis/site/v2/sports/{sport}/{league}/summary",
-        # Older style v2 path with eventId in the URL
-        f"https://site.web.api.espn.com/apis/v2/sports/{sport}/{league}/summary/{event_id}",
-        f"https://site.api.espn.com/apis/v2/sports/{sport}/{league}/summary/{event_id}",
-    ]
-
-
-# -----------------------------
-# Scoreboard parsing helpers
-# -----------------------------
-def _is_national_from_comp(comp: dict) -> tuple[bool, str | None]:
-    """
-    Guess if a game is on national TV based on 'broadcasts' field.
-    Returns (is_national, network_short_name_or_None).
-    """
-    broadcasts = comp.get("broadcasts") or []
-    if not broadcasts:
-        return False, None
-
-    best_name: str | None = None
-
-    for b in broadcasts:
-        market = (b.get("market") or "").lower()
-        names = b.get("names") or []
-
-        if not names and "broadcasters" in b:
-            names = [
-                br.get("shortName") or br.get("name")
-                for br in (b.get("broadcasters") or [])
-            ]
-
-        short: str | None = None
-        for n in names:
-            if n:
-                short = str(n)
-                break
-
-        if not short:
-            continue
-
-        if market == "national":
-            return True, short
-
-        if not best_name:
-            best_name = short
-
-    if best_name:
-        # Treat as "national" enough for our purposes (for posting copy).
-        return True, best_name
-
-    return False, None
-
-
-def _parse_event(league_key: str, comp: dict, e: dict) -> dict | None:
-    """
-    Normalize one ESPN event/competition into a compact dict we can use later.
-
-    Returns:
-      {
-        "sport": league_key,
-        "road": str,
-        "home": str,
-        "road_short": str,
-        "home_short": str,
-        "network": str|None,
-        "neutral_site": bool,
-        "event_name": str,
-        "event_id": str,
-        "comp_id": str,
-        "completed": bool,
-      }
-    """
-    try:
-        event_id = str(e.get("id") or "")
-        comp_id = str((comp.get("id") or event_id))
-
-        road = home = ""
-        road_short = home_short = ""
-
-        for c in (comp.get("competitors") or []):
-            team = c.get("team") or {}
-            long_name = (
-                team.get("displayName")
-                or team.get("name")
-                or team.get("shortDisplayName")
-                or ""
-            )
-            short_name = (
-                team.get("shortDisplayName")
-                or team.get("displayName")
-                or team.get("name")
-                or ""
-            )
-
-            if c.get("homeAway") == "home":
-                home = long_name
-                home_short = short_name
-            else:
-                road = long_name
-                road_short = short_name
-
-        neutral = bool(comp.get("neutralSite"))
-        event_name = e.get("name") or comp.get("name") or ""
-
-        is_nat, net = _is_national_from_comp(comp)
-        network = net if is_nat else None
-
-        status_type = (e.get("status") or {}).get("type") or {}
-        state = (status_type.get("state") or "").lower()
-        completed = state == "post"
-
-        return {
-            "sport": league_key,
-            "road": road,
-            "home": home,
-            "road_short": road_short or road,
-            "home_short": home_short or home,
-            "network": network,
-            "neutral_site": neutral,
-            "event_name": event_name,
-            "event_id": event_id,
-            "comp_id": comp_id,
-            "completed": completed,
-        }
-    except Exception as ex:  # defensive
-        _log(f"[DEBUG] parse event error: {ex}")
-        return None
-
-
-def list_final_events_for_date(date_iso: str, leagues: list[str]) -> list[dict]:
-    """
-    Return normalized events for leagues that look 'final-like' on date (YYYY-MM-DD).
-
-    Resilience features:
-      - Uses official site.api \"scoreboard\" endpoints (with /apis/site/v2/ path).
-      - Adds NCAAF-specific params (groups=80, limit=500) to get all FBS games.
-      - Tries both YYYYMMDD and YYYY-MM-DD for the DATE_PARAM.
-      - Lets you override base URLs via ESPN_SCOREBOARD_BASES env var.
-    """
-    out: list[dict] = []
-
-    iso_dash = date_iso.strip()
-    iso_compact = iso_dash.replace("-", "")
-
-    for league_key in leagues:
-        if league_key not in LEAGUE_PATH:
-            continue
-
-        urls = _scoreboard_urls(league_key)
-        data: dict | None = None
-
-        # NCAAF wants FBS group and a decent limit
-        extra_params: dict[str, str] = {}
-        if league_key == "NCAAF":
-            extra_params["groups"] = "80"   # FBS
-            extra_params["limit"] = "500"
-
-        for u in urls:
-            # Try compact form first (ESPN examples mostly use YYYYMMDD)
-            for d in (iso_compact, iso_dash):
-                params = {DATE_PARAM: d}
-                params.update(extra_params)
-                data = _get(u, params=params)
-                if data and isinstance(data, dict) and data.get("events"):
-                    _log(
-                        f"[INFO] scoreboard OK for {league_key} on {iso_dash} "
-                        f"via {u} {DATE_PARAM}={d}"
-                    )
-                    break
-            if data and data.get("events"):
-                break
-
-        if not data or not data.get("events"):
-            _log(f"[WARN] no scoreboard data for {league_key} on {iso_dash}")
-            continue
-
-        events = data.get("events") or []
-        for e in events:
-            comps = e.get("competitions") or []
-            if not comps:
-                continue
-            comp = comps[0]
-            parsed = _parse_event(league_key, comp, e)
-            if not parsed:
-                continue
-            if parsed["completed"]:
-                out.append(parsed)
-
-    _log(f"[INFO] {iso_dash} FINAL-like events found: {len(out)}")
-    return out
-
-
-# -----------------------------
-# Public helpers expected by main.py
-# -----------------------------
-def _to_iso(date_str: str) -> str:
-    """
-    Normalize 8-digit dates (YYYYMMDD) to ISO \"YYYY-MM-DD\".
-    Any other string is returned unchanged.
-    """
-    s = date_str.strip()
-    if len(s) == 8 and s.isdigit():
-        return f"{s[0:4]}-{s[4:6]}-{s[6:8]}"
-    return s
-
-
-def get_final_like_events(sport_lower: str, date_str: str) -> list[dict]:
-    """
-    Entry point called by main.py.
-
-    Returns a list of dicts shaped for posting:
-      { id, competition_id, away, home, away_short, home_short, broadcast }
-    """
-    sport_up = sport_lower.upper()
-    iso = _to_iso(date_str)
-    raw = list_final_events_for_date(iso, [sport_up])
-
-    out: list[dict] = []
-    for ev in raw:
-        out.append(
-            {
-                "id": ev["event_id"],
-                "competition_id": ev["comp_id"],
-                "away": ev["road"],
-                "home": ev["home"],
-                "away_short": ev.get("road_short") or ev["road"],
-                "home_short": ev.get("home_short") or ev["home"],
-                "broadcast": ev["network"],
-            }
-        )
-    return out
-
-
-# -----------------------------
-# Win probability fetch
-# -----------------------------
-def fetch_wp_quick(sport_lower: str, event_id: str, comp_id: str | None) -> list[float]:
-    """
-    Fetch win-probability series for the HOME team for a given event/competition.
-    Returns a list of floats in [0, 1], or [] on error.
-    """
-    league_key = sport_lower.upper()
-    if league_key not in LEAGUE_PATH:
-        _log(f"[WARN] unknown sport for WP fetch: {sport_lower}")
-        return []
-
-    urls = _summary_urls(league_key, event_id)
-    data: dict | None = None
-
-    for u in urls:
-        if u.endswith("summary") or "summary?" in u:
-            # summary endpoint that expects ?event= in query
-            data = _get(u, params={"event": event_id})
-        else:
-            data = _get(u)
-
-        if data:
+    broadcast = ""
+    # ESPN scoreboard often has a "broadcasts" list
+    for b in comp.get("broadcasts") or []:
+        name = b.get("name") or ""
+        network = b.get("shortName") or b.get("name") or ""
+        if network:
+            broadcast = network
             break
 
-    if not data:
-        _log(f"[WARN] no summary data for {league_key} event={event_id}")
+    if not broadcast:
+        # Sometimes it's under "geoBroadcasts"
+        for gb in comp.get("geoBroadcasts") or []:
+            media = gb.get("media") or {}
+            network = media.get("shortName") or media.get("name") or ""
+            if network:
+                broadcast = network
+                break
+
+    return broadcast
+
+
+def _extract_comp_info(comp: dict) -> dict | None:
+    status = comp.get("status") or {}
+    if not _is_final_like(status):
+        return None
+
+    competition_id = comp.get("id")
+    if not competition_id:
+        return None
+
+    # ESPN events also have a top-level "id". We flow that through as event_id.
+    event_id = None
+    # Some scoreboards propagate it; others we might have to inspect parent.
+    # For simplicity, we let caller attach it if needed; here we just carry
+    # competition id and leave event_id placeholder.
+    # In this adapter, we treat competition_id as the primary id.
+    # The main script often uses the "event" id for formatting links, so
+    # we pass both when possible.
+
+    # Score / teams
+    comp_data: dict = {
+        "competition_id": competition_id,
+        "event_id": comp.get("id"),
+        "status": status,
+    }
+
+    # Simplified team names + scores
+    home = None
+    away = None
+
+    for c in comp.get("competitors") or []:
+        team = c.get("team") or {}
+        is_home = c.get("homeAway") == "home"
+        # Use displayName as a default; fallback to "shortDisplayName" etc.
+        name = (
+            team.get("displayName")
+            or team.get("shortDisplayName")
+            or team.get("name")
+            or ""
+        )
+        abbrev = team.get("abbreviation") or ""
+        score = c.get("score")
+        record = ""
+        if c.get("records"):
+            record = c["records"][0].get("summary") or ""
+
+        entry = {
+            "name": name,
+            "abbrev": abbrev,
+            "score": score,
+            "record": record,
+            "is_home": is_home,
+            "id": team.get("id"),
+        }
+
+        if is_home:
+            home = entry
+        else:
+            away = entry
+
+    comp_data["home"] = home
+    comp_data["away"] = away
+    comp_data["broadcast"] = _extract_broadcast(comp)
+
+    return comp_data
+
+
+def get_final_like_events(league_key: str, date_iso: str) -> list[dict]:
+    """
+    Return a list of games (competitions) that look "final" for a league+date.
+
+    Each element is a dict with:
+        - competition_id
+        - event_id (if available)
+        - status (raw ESPN status dict)
+        - home: { name, abbrev, score, record, is_home, id }
+        - away: { ... }
+        - broadcast: "TNT", "ESPN", etc. (best effort)
+    """
+    league_key = league_key.upper()
+    if league_key not in LEAGUE_PATH:
+        _log(f"[WARN] league_key {league_key!r} not configured")
         return []
 
-    try:
-        wp_list = data.get("winprobability") or data.get("winProbability") or []
-        if not wp_list:
-            _log("[DEBUG] no winprobability array present")
-            return []
+    urls = _scoreboard_urls_for_league(league_key)
+    params = _scoreboard_params_for_league(league_key, date_iso)
 
-        series: list[float] = []
-        for pt in wp_list:
-            home_wp = (
-                pt.get("homeWinPercentage")
-                or pt.get("homeWinProb")
-                or pt.get("homeWinProbability")
-            )
-            if home_wp is None:
-                continue
-            try:
-                v = float(home_wp)
-            except (TypeError, ValueError):
-                continue
-            series.append(v)
+    final_games: list[dict] = []
+    any_success = False
 
-        _log(f"[INFO] WP series points: {len(series)} for {league_key} {event_id}")
-        return series
-    except Exception as ex:  # defensive
-        _log(f"[DEBUG] parse WP error: {ex}")
+    for url in urls:
+        data = _get(url, params=params)
+        if not data:
+            continue
+        any_success = True
+        comps = _extract_competitions(data)
+        for comp in comps:
+            info = _extract_comp_info(comp)
+            if info:
+                final_games.append(info)
+
+        if final_games:
+            break
+
+    if not any_success:
+        _log(f"[WARN] no scoreboard data for {league_key} on {date_iso}")
+    else:
+        _log(
+            f"[INFO] {date_iso} FINAL-like events found: {len(final_games)}",
+        )
+
+    return final_games
+
+
+# -----------------------------
+# Win probability (WP) adapter
+# -----------------------------
+
+HEADERS: dict = {
+    "User-Agent": "RewatchabilityBot/1.0 (https://rewatchability.com)",
+}
+
+
+def _extract_wp_series_from_summary(summary: dict) -> list[float]:
+    """
+    Extract a home-team win probability series from an ESPN summary JSON.
+
+    Returns a list of floats in [0, 1]. If anything goes wrong, returns [].
+    """
+    # Path to WP chart depends on sport; we handle the known structure:
+    # summary["winprobability"]["homeWinPercentage"] with "value" fields.
+    wp_root = summary.get("winprobability") or {}
+    series: list[float] = []
+
+    for point in wp_root.get("homeWinPercentage") or []:
+        val = point.get("value")
+        if val is None:
+            continue
+        try:
+            f = float(val)
+        except Exception:
+            continue
+        series.append(f)
+
+    return series
+
+
+def fetch_wp_quick(league_key: str, event_id: str) -> list[float]:
+    """
+    Fetch a quick WP series for a single event by hitting the summary API.
+
+    We return a list of *home-team* win probabilities in [0, 1]. If anything
+    fails, we return [].
+    """
+    league_key = league_key.upper()
+    url = _summary_url_for_event(league_key, event_id)
+    if not url:
+        _log(f"[WARN] no summary URL for league {league_key}")
         return []
+
+    params = {"event": event_id}
+    summary = _get(url, params=params)
+    if not summary:
+        return []
+
+    series_raw = _extract_wp_series_from_summary(summary)
+    if not series_raw:
+        _log(f"[DEBUG] no WP series for {league_key} {event_id}")
+        return []
+
+    # Normalize to [0, 1]; some feeds may be 0–100 percentages.
+    series: list[float] = []
+    for val in series_raw:
+        if val > 1.0:
+            val = val / 100.0
+        if val < 0.0 or val > 1.0:
+            continue
+        series.append(val)
+
+    _log(f"[INFO] WP series points: {len(series)} for {league_key} {event_id}")
+    return series
