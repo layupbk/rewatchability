@@ -16,45 +16,23 @@ from ledger import (
     mark_posted,
 )
 
+# ------
+# Config
+# ------
 
-# ---------------- Env + global knobs ---------------- #
+POLL_SECONDS: int = int(os.getenv("POLL_SECONDS", "120"))
+LOOKBACK_DAYS: int = int(os.getenv("LOOKBACK_DAYS", "1"))
+MIN_POST_SCORE: int = int(os.getenv("MIN_POST_SCORE", "70"))
 
-POLL_SECONDS = int(os.getenv("POLL_SECONDS", "120"))
-
-# ESPN's raw EI (sum of |ΔWP|) is much larger than our calibrated ranges.
-# Default: 1.0 (i.e., EI_raw is passed directly to scoring.py).
-EI_SCALE = float(os.getenv("ESPN_EI_SCALE", "1.0"))
-
-# Minimum score to actually POST a game to X (legacy guard; we now use
-# explicit posting rules below, but this can still be used if needed).
-MIN_POST_SCORE = int(os.getenv("MIN_POST_SCORE", "90"))
-
-
-# ---------------- Posting rules helper ---------------- #
-
-def _meets_posting_rules(sport_up: str, score_val: int, network: str) -> bool:
-    """
-    PRO (NBA / NFL / MLB):
-      - Post ALL national TV games (network != "Streaming / Local")
-      - Post any other game with score >= 70
-
-    COLLEGE (NCAAF / NCAAB):
-      - Post ONLY if national TV AND score >= 70
-    """
-    sport_up = sport_up.upper()
-    network = (network or "").strip() or "Streaming / Local"
-    is_national = network != "Streaming / Local"
-    is_college = sport_up in ("NCAAF", "NCAAB", "NCAAM", "CBB")
-
-    if is_college:
-        return is_national and score_val >= 70
-    else:
-        return is_national or score_val >= 70
+# EI_SCALE keeps the live EI on the same scale as the offline CSVs we used
+# to derive the constants in scoring.py. With 0.01 we’re in the 0.0–0.4 range
+# that matches those distributions.
+EI_SCALE: float = float(os.getenv("EI_SCALE", "0.01"))  # global scale so EI matches offline CSVs
 
 
-# -----
-# EI / scoring helpers
-# -----
+# ----------------
+# EI / WP helpers
+# ----------------
 
 def calc_ei_from_home_series(series_raw):
     """
@@ -76,113 +54,158 @@ def calc_ei_from_home_series(series_raw):
             val = float(p)
         except (TypeError, ValueError):
             continue
+
+        # Normalize 0–100 -> 0–1 if needed
+        if val > 1.0:
+            val /= 100.0
+
+        # Clamp to [0,1]
         if val < 0.0:
             val = 0.0
         if val > 1.0:
             val = 1.0
+
         series.append(val)
 
     if len(series) < 2:
         return 0.0, 0.0
 
-    ei_raw = 0.0
-    prev = series[0]
-    for x in series[1:]:
-        ei_raw += abs(x - prev)
-        prev = x
+    diffs = [abs(series[i] - series[i - 1]) for i in range(1, len(series))]
+    ei_raw = float(sum(diffs))
 
+    # Shrink to better match our calibrated EI range.
     ei_scaled = ei_raw * EI_SCALE
     return ei_scaled, ei_raw
 
 
+def _scoring_key_for_sport(sport_lower: str) -> str:
+    """
+    Map ESPN sport keys into scoring.py keys.
+    """
+    s = sport_lower.lower()
+    if s == "ncaam":
+        return "NCAAB"   # scoring.py expects NCAAB for college hoops
+    if s == "ncaaf":
+        return "NCAAF"
+    return s.upper()     # NBA, NFL, MLB
+
+
 def _date_line_from_iso(date_iso: str) -> str:
-    d = datetime.date.fromisoformat(date_iso)
-    return to_weekday_mm_d_yy(d)
-
-
-def _compute_game_text(sport_lower: str, event_id: str, comp_id, game: dict, date_iso: str):
     """
-    Fetch WP, compute EI, score, vibe, and render the final post text.
-    Returns:
-      (score_val, text) or (None, None) on failure.
+    Format an ISO date string (YYYY-MM-DD) into a short "weekday · mm/dd/yy" string.
     """
-    sport_up = sport_lower.upper()
-
-    # Fetch win-probability series and compute EI
-    series = fetch_wp_quick(sport_lower, event_id, comp_id)
-    if not series:
-        print(f"[WARN] no WP series for {sport_up} {event_id}", flush=True)
-        return None, None
-
-    ei_scaled, ei_raw = calc_ei_from_home_series(series)
-
-    scored = score_game(sport_up, ei_scaled)
-    score_val = scored.score
-
-    # Log EI + score so we can see how things look:
-    print(
-        f"[EI] {sport_up} {event_id} raw={ei_raw:.3f} "
-        f"scaled={ei_scaled:.3f} score={score_val}",
-        flush=True,
-    )
-
-    vibe = pick_vibe(score_val)
-    date_line = _date_line_from_iso(date_iso)
-    network = (game.get("broadcast") or "").strip() or "Streaming / Local"
-
-    text = format_post(
-        game=game,
-        score=score_val,
-        vibe=vibe,
-        date=date_line,
-        sport=sport_up,
-        neutral_site=False,  # can be wired later if needed
-        network=network,
-    )
-
-    return score_val, text
+    try:
+        # formatting.to_weekday_mm_d_yy expects a string, so we pass date_iso through
+        return to_weekday_mm_d_yy(date_iso)
+    except Exception:
+        return date_iso
 
 
-# ---------------- Recap for already-posted games ---------------- #
+def _date_range_to_poll(now_utc: datetime.datetime) -> list[str]:
+    """
+    Decide which dates (as ISO strings) to poll based on current UTC time.
 
-def recap_already_posted(
+    We generally want:
+      - today (in UTC)
+      - and a configurable lookback window in days (yesterday, day before, etc.)
+    """
+    today = now_utc.date()
+    dates = []
+    for delta in range(LOOKBACK_DAYS, -1, -1):
+        d = today - datetime.timedelta(days=delta)
+        dates.append(d.isoformat())
+    return dates
+
+
+# ----------------
+# Core game logic
+# ----------------
+
+def _compute_game_text(
     sport_lower: str,
     event_id: str,
     comp_id,
     game: dict,
     date_iso: str,
-) -> None:
+):
     """
-    Used when ledger says we've already posted this game.
-    We still want a recap in logs if it's worth talking about,
-    but avoid duplicate X posts.
+    Fetch WP series, compute EI and score, pick vibe tags, and render final text.
+
+    Returns:
+      (score_val: int | None, text: str | None)
+    """
+    sport_up = sport_lower.upper()
+    scoring_key = _scoring_key_for_sport(sport_lower)
+
+    # 1) Fetch win probability series
+    series = fetch_wp_quick(sport_lower, event_id)
+    if not series:
+        print(f"[WARN] No WP data for {sport_up} {event_id}, skipping.", flush=True)
+        return None, None
+
+    # 2) Compute EI
+    ei_scaled, ei_raw = calc_ei_from_home_series(series)
+
+    # 3) Compute score (piecewise per sport)
+    scored = score_game(scoring_key, ei_scaled)
+    score_val = scored.score
+
+    print(
+        f"[EI] {sport_up} {event_id} raw={ei_raw:.3f} scaled={ei_scaled:.3f} score={score_val}",
+        flush=True,
+    )
+
+    # 4) Pick vibe tags and format final text
+    vibes = pick_vibe(
+        sport=scoring_key,
+        score=score_val,
+        ei=ei_scaled,
+        meta=game,
+    )
+
+    date_line = _date_line_from_iso(date_iso)
+    text = format_post(
+        sport=scoring_key,
+        meta=game,
+        score=score_val,
+        ei=ei_scaled,
+        vibes=vibes,
+        date_line=date_line,
+    )
+    return score_val, text
+
+
+# ---------------- Preview (no posting) ---------------- #
+
+def _preview_game_only(
+    sport_lower: str,
+    event_id: str,
+    comp_id,
+    game: dict,
+    date_iso: str,
+):
+    """
+    Recompute EI & score and just print the would-be post text for a game
+    that is already in the ledger.
+
+    This is useful so the Render logs still show something for these games.
     """
     score_val, text = _compute_game_text(sport_lower, event_id, comp_id, game, date_iso)
-    if score_val is None:
+    if score_val is None or text is None:
         return
 
-    sport_up = sport_lower.upper()
-    network = (game.get("broadcast") or "").strip() or "Streaming / Local"
-    if not _meets_posting_rules(sport_up, score_val, network):
-        print(
-            f"[RECAP SKIP] {sport_up} {event_id} score={score_val} "
-            f"network='{network}' (posting rules)",
-            flush=True,
-        )
-        return
-
-    print(f"[RECAP] already posted {event_id} — preview only", flush=True)
+    print(f"[PREVIEW-ONLY] {event_id} score={score_val}", flush=True)
     print(text, flush=True)
     print("-" * 40, flush=True)
 
 
-# ---------------- Posting for new games ---------------- #
+# ---------------- Single-game posting flow ---------------- #
 
 def post_once(sport_lower: str, event_id: str, comp_id, game: dict, date_iso: str, ledger: dict) -> bool:
     """
     Full posting flow for a *new* game (not in ledger yet):
       - compute EI & score
-      - apply national-TV + 70+ posting rules
+      - skip if below MIN_POST_SCORE
       - print post text
       - call post_to_x
       - mark as posted in ledger on success
@@ -191,12 +214,11 @@ def post_once(sport_lower: str, event_id: str, comp_id, game: dict, date_iso: st
     if score_val is None:
         return False
 
-    sport_up = sport_lower.upper()
-    network = (game.get("broadcast") or "").strip() or "Streaming / Local"
-    if not _meets_posting_rules(sport_up, score_val, network):
+    # Don't post low/medium games – only strong ones.
+    if score_val < MIN_POST_SCORE:
         print(
-            f"[SKIP] {sport_up} {event_id} score={score_val} "
-            f"network='{network}' (posting rules)",
+            f"[SKIP] score {score_val} < MIN_POST_SCORE={MIN_POST_SCORE} "
+            f"for {event_id}",
             flush=True,
         )
         return False
@@ -204,7 +226,7 @@ def post_once(sport_lower: str, event_id: str, comp_id, game: dict, date_iso: st
     print(text, flush=True)
     print("-" * 40, flush=True)
 
-    # This calls the post stub in publisher_x.py (wired to X in production).
+    # This calls the NO-OP stub in publisher_x.py for now.
     if post_to_x(text):
         sport_up = sport_lower.upper()
         print(f"[POSTED] {event_id} ({sport_up})", flush=True)
@@ -212,76 +234,78 @@ def post_once(sport_lower: str, event_id: str, comp_id, game: dict, date_iso: st
         save_ledger(ledger)
         return True
 
-    print(f"[FAIL] X post failed for {event_id}", flush=True)
+    print(f"[ERROR] Failed to post {event_id}", flush=True)
     return False
 
 
 # ---------------- Main autopilot loop ---------------- #
 
-def _date_range_to_poll(now_utc: datetime.datetime) -> list[str]:
-    """
-    Poll both today (UTC) and "yesterday" so that late-night games
-    still get picked up correctly regardless of timezone.
-    """
-    today = now_utc.date()
-    yesterday = today - datetime.timedelta(days=1)
-    return [
-        yesterday.isoformat(),
-        today.isoformat(),
-    ]
+SPORTS = ["nba", "nfl", "mlb", "ncaaf", "ncaam"]
 
 
-def run_once(now_utc: datetime.datetime | None = None):
+def run():
     """
-    One full polling cycle across all supported sports.
+    Main polling loop:
+      - load / prune ledger
+      - loop over sports
+      - for each, figure out which dates to poll
+      - fetch final-like events for those dates
+      - for each event, decide whether to post or preview
+      - sleep, repeat
     """
-    if now_utc is None:
-        now_utc = datetime.datetime.utcnow()
+    print("[RUN] starting Rewatchability autopilot", flush=True)
 
-    dates = _date_range_to_poll(now_utc)
-
-    # Load and prune ledger (to prevent it from growing forever)
     ledger = load_ledger()
     prune_ledger(ledger)
+    save_ledger(ledger)
 
-    sports = [
-        ("nba", "NBA"),
-        ("nfl", "NFL"),
-        ("mlb", "MLB"),
-        ("ncaaf", "NCAAF"),
-        ("ncaab", "NCAAB"),
-    ]
-
-    for sport_lower, sport_up in sports:
-        for date_iso in dates:
-            print(f"[LOOP] checking {sport_up} for {date_iso}", flush=True)
-            events = get_final_like_events(sport_lower, date_iso)
-            print(
-                f"[FOUND] {len(events)} final-like {sport_up} games on {date_iso}",
-                flush=True,
-            )
-
-            for game in events:
-                event_id = str(game["id"])
-                comp_id = game.get("competition_id")
-
-                if already_posted(ledger, event_id):
-                    recap_already_posted(sport_lower, event_id, comp_id, game, date_iso)
-                else:
-                    post_once(sport_lower, event_id, comp_id, game, date_iso, ledger)
-
-
-def main():
-    print("[RUN] starting Rewatchability autopilot", flush=True)
     while True:
         try:
-            now_utc = datetime.datetime.utcnow()
-            run_once(now_utc)
+            # Always use timezone-aware UTC now to avoid deprecation warnings.
+            now_utc = datetime.datetime.now(datetime.timezone.utc)
+
+            for sport_lower in SPORTS:
+                # Determine which dates to poll for this sport
+                dates_to_poll = _date_range_to_poll(now_utc)
+
+                for date_iso in dates_to_poll:
+                    print(f"[LOOP] checking {sport_lower.upper()} for {date_iso}", flush=True)
+
+                    games = get_final_like_events(sport_lower, date_iso=date_iso)
+                    if not games:
+                        print(
+                            f"[FOUND] 0 final-like {sport_lower.upper()} games on {date_iso}",
+                            flush=True,
+                        )
+                        continue
+
+                    print(
+                        f"[FOUND] {len(games)} final-like {sport_lower.upper()} games on {date_iso}",
+                        flush=True,
+                    )
+
+                    for g in games:
+                        event_id = g.get("id")
+                        comp = g.get("competitions", [{}])[0]
+                        comp_id = comp.get("id")
+
+                        if not event_id or not comp_id:
+                            continue
+
+                        # If we've already posted this game, just preview.
+                        if already_posted(ledger, event_id):
+                            _preview_game_only(sport_lower, event_id, comp_id, g, date_iso)
+                            continue
+
+                        # Otherwise, attempt a full post.
+                        post_once(sport_lower, event_id, comp_id, g, date_iso, ledger)
+
         except Exception as e:
             print(f"[ERROR] top-level loop error: {e}", flush=True)
-        print(f"[SLEEP] {POLL_SECONDS} seconds", flush=True)
+
+        # Sleep between polls
         time.sleep(POLL_SECONDS)
 
 
 if __name__ == "__main__":
-    main()
+    run()
