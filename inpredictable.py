@@ -77,10 +77,13 @@ def _parse_precap_table(html: str) -> Dict[Tuple[str, str], float]:
 
     Strategy:
       - Convert HTML to plain text.
-      - Split into lines.
-      - For any line that contains '@' and 'Finished', extract:
-            AWAY @ HOME   (3-letter codes)
-            Finished X.Y  (Excitement)
+      - In the whole text, look for patterns like:
+
+            ATL @ PHI ... Finished 13.7
+            OKC @ POR ... Finished 8.2
+            ...
+
+        where the 'Finished X.Y' part can be on the same line or later.
     """
     rows: Dict[Tuple[str, str], float] = {}
 
@@ -90,30 +93,22 @@ def _parse_precap_table(html: str) -> Dict[Tuple[str, str], float]:
     text = _html_to_text(html)
     _log(f"PreCap text length = {len(text)} chars")
 
-    lines = text.splitlines()
-
-    # patterns applied per-line
-    code_pattern = re.compile(r"([A-Za-z]{3})\s*@\s*([A-Za-z]{3})")
-    excite_pattern = re.compile(r"Finished\s+(\d+(\.\d+)?)", re.IGNORECASE)
+    # Robust pattern:
+    #   AWAY(3) @ HOME(3) ... Finished <float>
+    #
+    # DOTALL so 'Finished' can be across a newline or separated by other text.
+    pattern = re.compile(
+        r"([A-Z]{3})\s*@\s*([A-Z]{3}).*?Finished\s+(\d+(\.\d+)?)",
+        re.IGNORECASE | re.DOTALL,
+    )
 
     count_finished = 0
     debug_shown = 0
 
-    for raw_line in lines:
-        line = raw_line.strip()
-        if "@" not in line:
-            continue
-        if "Finished" not in line and "finished" not in line:
-            continue
-
-        m_codes = code_pattern.search(line)
-        m_ei = excite_pattern.search(line)
-        if not m_codes or not m_ei:
-            continue
-
-        away = m_codes.group(1).upper()
-        home = m_codes.group(2).upper()
-        excite_str = m_ei.group(1)
+    for m in pattern.finditer(text):
+        away = m.group(1).upper()
+        home = m.group(2).upper()
+        excite_str = m.group(3)
 
         try:
             excite_val = float(excite_str)
@@ -123,9 +118,14 @@ def _parse_precap_table(html: str) -> Dict[Tuple[str, str], float]:
         rows[(away, home)] = excite_val
         count_finished += 1
 
-        # Log a few sample lines so we can see what's being parsed
+        # Log a few sample rows so we can see what is being parsed
         if debug_shown < 10:
-            _log(f"ROW parsed: {away} @ {home} -> Excitement {excite_val} (line={line})")
+            snippet = text[max(0, m.start() - 40) : m.end() + 40]
+            snippet = snippet.replace("\n", " ")
+            _log(
+                f"ROW parsed: {away} @ {home} -> Excitement {excite_val} "
+                f"(context=...{snippet}...)"
+            )
             debug_shown += 1
 
     _log(f"parsed {count_finished} finished games from PreCap table")
