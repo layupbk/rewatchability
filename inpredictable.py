@@ -1,21 +1,18 @@
 # inpredictable.py
-# Scraper for inpredictable.com's PreCap "Excitement" tables, with per-date caching.
+# Scraper for inpredictable.com's PreCap "Excitement" tables.
 #
 # Supports:
 #   - NBA  -> https://stats.inpredictable.com/nba/preCap.php
 #   - WNBA -> https://stats.inpredictable.com/wnba/preCap.php
 #
 # Public API:
-#   fetch_excitement_map("NBA",  "2025-11-30")
-#   fetch_excitement_map("WNBA", "2025-11-30")
-#
-# Returns:
-#   dict[(away_abbrev, home_abbrev), excitement_float]
+#   fetch_excitement_map("NBA")  -> dict[(away_abbrev, home_abbrev), excitement_float]
+#   fetch_excitement_map("WNBA") -> same, for WNBA
 
 from __future__ import annotations
 
 import re
-import datetime
+import time
 from typing import Dict, Tuple, Optional
 
 import requests
@@ -23,7 +20,7 @@ import requests
 NBA_PRECAP_URL = "https://stats.inpredictable.com/nba/preCap.php"
 WNBA_PRECAP_URL = "https://stats.inpredictable.com/wnba/preCap.php"
 
-PRECAP_URLS: Dict[str, str] = {
+PRECAP_URLS = {
     "NBA": NBA_PRECAP_URL,
     "WNBA": WNBA_PRECAP_URL,
 }
@@ -39,8 +36,10 @@ GAME_CELL_RE = re.compile(
     re.VERBOSE,
 )
 
-# Per-(league, date_iso) cache: (league_up, date_iso) -> {"mapping": dict, "fetched_at": datetime}
-_CACHE: Dict[Tuple[str, str], Dict[str, object]] = {}
+# Simple in-process cache:
+#   league -> {"ts": float, "mapping": dict[(away,home)->float]}
+_CACHE: Dict[str, Dict[str, object]] = {}
+CACHE_TTL_SECONDS = 120.0  # okay to re-use for a couple of minutes
 
 
 def _log(msg: str) -> None:
@@ -67,10 +66,10 @@ def _parse_precap_table(html: str) -> Dict[Tuple[str, str], float]:
     """
     rows: Dict[Tuple[str, str], float] = {}
 
-    # Normalize <br> variations to spaces for easier regex parsing.
+    # Normalize line breaks
     cleaned = re.sub(r"<br\s*/?>", " ", html, flags=re.IGNORECASE)
 
-    # Anchor around the header line.
+    # Find the header row that introduces Rank/Game/Status/Excitement/Tension
     header_match = re.search(
         r"Rank\s*Game\s*Status\s*Excitement\s*Tension",
         cleaned,
@@ -81,6 +80,7 @@ def _parse_precap_table(html: str) -> Dict[Tuple[str, str], float]:
 
     table_text = cleaned[header_match.end() :]
 
+    # Each row roughly: rank, game, status, excitement, tension, ...
     game_pattern = re.compile(
         r"""
         (?P<rank>\d+)
@@ -97,7 +97,6 @@ def _parse_precap_table(html: str) -> Dict[Tuple[str, str], float]:
     for m in game_pattern.finditer(table_text):
         status = m.group("status").strip().lower()
         if status != "finished":
-            # We only want completed games for EI.
             continue
 
         game_cell = m.group("game")
@@ -122,59 +121,60 @@ def _parse_precap_table(html: str) -> Dict[Tuple[str, str], float]:
     return rows
 
 
-def fetch_excitement_map(league: str, date_iso: str) -> Dict[Tuple[str, str], float]:
+def _get_cached_mapping(league_up: str) -> Optional[Dict[Tuple[str, str], float]]:
+    entry = _CACHE.get(league_up)
+    if not entry:
+        return None
+    ts = entry.get("ts")
+    mapping = entry.get("mapping")
+    if not isinstance(mapping, dict) or not isinstance(ts, (int, float)):
+        return None
+    if (time.time() - ts) > CACHE_TTL_SECONDS:
+        return None
+    return mapping  # still fresh
+
+
+def _set_cached_mapping(league_up: str, mapping: Dict[Tuple[str, str], float]) -> None:
+    _CACHE[league_up] = {"ts": time.time(), "mapping": mapping}
+
+
+def fetch_excitement_map(league: str) -> Dict[Tuple[str, str], float]:
     """
-    Return a dict mapping (away_abbr, home_abbr) -> inpredictable Excitement (raw),
-    with per-(league, date_iso) caching.
+    Return a dict mapping (away_abbr, home_abbr) -> inpredictable Excitement (raw).
 
     Behavior:
-      - Try to pull the PreCap page and parse it.
-      - If we get a non-empty mapping, we cache and return it.
-      - If the fetch fails OR parses to zero finished games, we fall back to
-        the last cached mapping for that (league, date_iso) if it exists.
-      - Otherwise we return {}.
+      - Try to fetch and parse the current PreCap page.
+      - If it yields a non-empty mapping, cache it and return.
+      - If it fails or parses to empty, fall back to a recent cached mapping
+        (if available) instead of returning {}.
     """
     league_up = (league or "").upper()
     if league_up not in PRECAP_URLS:
         raise ValueError(f"Unsupported league for inpredictable PreCap: {league!r}")
 
-    cache_key = (league_up, date_iso)
     url = PRECAP_URLS[league_up]
 
     html = _fetch_precap_html(url)
     if html:
         mapping = _parse_precap_table(html)
         if mapping:
-            _CACHE[cache_key] = {
-                "mapping": mapping,
-                "fetched_at": datetime.datetime.utcnow(),
-            }
-            _log(
-                f"parsed {len(mapping)} finished games from PreCap for {league_up} "
-                f"({date_iso})"
-            )
+            _set_cached_mapping(league_up, mapping)
+            _log(f"parsed {len(mapping)} finished games from PreCap for {league_up}")
             return mapping
         else:
-            _log(
-                f"parsed 0 finished games from PreCap for {league_up} ({date_iso}); "
-                "will try cache if available."
-            )
+            _log(f"parsed 0 finished games from PreCap for {league_up}")
     else:
-        _log(
-            f"no HTML from PreCap for {league_up} ({date_iso}); "
-            "will try cache if available."
-        )
+        _log(f"no HTML from PreCap for {league_up}")
 
-    # Fallback to cache for this league+date if we have one
-    cached = _CACHE.get(cache_key)
-    if cached and isinstance(cached.get("mapping"), dict):
-        mapping = cached["mapping"]  # type: ignore[assignment]
+    # Fallback: use cached mapping if available
+    cached = _get_cached_mapping(league_up)
+    if cached:
         _log(
-            f"using cached mapping with {len(mapping)} games for {league_up} "
-            f"({date_iso})"
+            f"using cached Excitement mapping for {league_up} "
+            f"(len={len(cached)})"
         )
-        return mapping  # type: ignore[return-value]
+        return cached
 
-    # No data from HTML and no cache.
-    _log(f"no PreCap data or cache for {league_up} ({date_iso})")
+    # Nothing available
+    _log(f"no Excitement data available (live or cache) for {league_up}")
     return {}
