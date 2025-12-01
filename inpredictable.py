@@ -76,12 +76,11 @@ def _parse_precap_table(html: str) -> Dict[Tuple[str, str], float]:
     Return {(away_abbr, home_abbr): excitement_float} for games
     where Status == "Finished".
 
-    We do NOT rely on specific HTML structure; we just work from
-    the plain text after tags are removed, matching lines like:
+    We do NOT rely on any "Rank Game Status Excitement" header anymore.
+    We just work from the plain text after tags are removed, matching rows like:
 
         1  Finished 13.7 82%38.1+65.0%
         2  Finished 8.2 89%1.7+18.7%
-        ...
 
     anywhere in the text.
     """
@@ -91,6 +90,7 @@ def _parse_precap_table(html: str) -> Dict[Tuple[str, str], float]:
         return rows
 
     text = _html_to_text(html)
+    _log(f"PreCap text length = {len(text)} chars")
 
     # Each row in text roughly:
     #   1  Finished 13.7 82%38.1+65.0%
