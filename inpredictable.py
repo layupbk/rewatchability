@@ -56,7 +56,7 @@ def _html_to_text(html: str) -> str:
     Very simple HTML → text converter:
     - Turn <br> into newlines
     - Drop all tags
-    - Normalize non-breaking spaces
+    - Normalize spaces
     """
     # 1) <br> -> newline so each row can live on its own line
     text = re.sub(r"<br\s*/?>", "\n", html, flags=re.IGNORECASE)
@@ -73,16 +73,14 @@ def _html_to_text(html: str) -> str:
 
 def _parse_precap_table(html: str) -> Dict[Tuple[str, str], float]:
     """
-    Return {(away_abbr, home_abbr): excitement_float} for games
-    where Status == "Finished".
+    Return {(away_abbr, home_abbr): excitement_float} for games.
 
-    We do NOT rely on any "Rank Game Status Excitement" header anymore.
-    We just work from the plain text after tags are removed, matching rows like:
+    We just work from plain text, matching rows like:
 
         1ATL @ PHIImage  Finished 13.7 82%38.1+65.0%
         2OKC @ PORImage  Finished 8.2 89%1.7+18.7%
 
-    anywhere in the text.
+    anywhere in the text (no header / rank dependence).
     """
     rows: Dict[Tuple[str, str], float] = {}
 
@@ -92,37 +90,26 @@ def _parse_precap_table(html: str) -> Dict[Tuple[str, str], float]:
     text = _html_to_text(html)
     _log(f"PreCap text length = {len(text)} chars")
 
-    # Each row in text roughly:
-    #   1ATL @ PHIImage  Finished 13.7 82%38.1+65.0%
+    # Simplest robust pattern:
+    #   AWAY(3) @ HOME(3) ... Finished <float>
     #
-    # Pattern:
-    #   rank (digits) at start of line
-    #   ...some junk...
-    #   AWAY @ HOME      (both exactly 3 capital letters, e.g. ATL @ PHI)
-    #   ...some junk...
-    #   Finished / In Progress / Scheduled
-    #   excitement (float)
-    line_pattern = re.compile(
+    # We don't care about rank, we only require "Finished".
+    pattern = re.compile(
         r"""
-        ^\s*
-        (?P<rank>\d+)                     # numeric rank at start of line
-        [^\n]*?
-        (?P<away>[A-Z]{3})\s*@\s*(?P<home>[A-Z]{3})  # e.g. ATL @ PHI
-        [^\n]*?
-        (?P<status>Finished|In\ Progress|Scheduled)
+        (?P<away>[A-Z]{3})          # e.g. ATL
+        \s*@\s*
+        (?P<home>[A-Z]{3})          # e.g. PHI
+        [^\n]*?                     # anything else on that same line
+        Finished
         \s+
-        (?P<excite>\d+(\.\d+)?)
+        (?P<excite>\d+(\.\d+)?)     # 13.7, 8.2, etc.
         """,
-        re.VERBOSE | re.IGNORECASE | re.MULTILINE,
+        re.VERBOSE | re.IGNORECASE,
     )
 
     count_finished = 0
 
-    for m in line_pattern.finditer(text):
-        status = m.group("status").strip().lower()
-        if status != "finished":
-            continue
-
+    for m in pattern.finditer(text):
         away = m.group("away").upper()
         home = m.group("home").upper()
         excite_str = m.group("excite")
