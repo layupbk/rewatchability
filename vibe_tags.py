@@ -16,6 +16,7 @@ PRIMARY_TAGS: Final[dict[str, str]] = {
     "40": "Lifeless",
 }
 
+
 def pick_vibe(score: int) -> str:
     """Return a short vibe tag for the given Rewatchability Score™."""
     # Clamp just in case
@@ -36,6 +37,7 @@ def pick_vibe(score: int) -> str:
     if s >= 50:
         return PRIMARY_TAGS["50"]
     return PRIMARY_TAGS["40"]
+
 
 # Backwards-compat alias used in older files
 vibe_tag_from_score = pick_vibe

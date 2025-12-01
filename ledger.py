@@ -1,5 +1,6 @@
 # ledger.py
-import os, json
+import os
+import json
 from datetime import datetime, timedelta, timezone
 
 # Where to store the ledger file (on your Render disk)
@@ -7,8 +8,10 @@ LEDGER_PATH = os.getenv("LEDGER_PATH", "/data/posted_ledger.json")
 # How long to remember posted games (days)
 LEDGER_DAYS = int(os.getenv("LEDGER_DAYS", "7"))
 
+
 def _now_iso() -> str:
     return datetime.now(timezone.utc).isoformat()
+
 
 def load_ledger() -> dict[str, str]:
     """Return {event_id: iso_timestamp}."""
@@ -24,6 +27,7 @@ def load_ledger() -> dict[str, str]:
         print(f"[LEDGER] load error: {e}", flush=True)
     return {}
 
+
 def save_ledger(ledger: dict[str, str]) -> None:
     try:
         os.makedirs(os.path.dirname(LEDGER_PATH), exist_ok=True)
@@ -33,11 +37,12 @@ def save_ledger(ledger: dict[str, str]) -> None:
     except Exception as e:
         print(f"[LEDGER] save error: {e}", flush=True)
 
+
 def prune_ledger(ledger: dict[str, str], days: int = LEDGER_DAYS) -> None:
     cutoff = datetime.now(timezone.utc) - timedelta(days=days)
     keep: dict[str, str] = {}
     removed = 0
-    for eid, ts in ledger.items():
+    for eid, ts in list(ledger.items()):
         try:
             when = datetime.fromisoformat(ts)
         except Exception:
@@ -52,8 +57,10 @@ def prune_ledger(ledger: dict[str, str], days: int = LEDGER_DAYS) -> None:
     ledger.clear()
     ledger.update(keep)
 
+
 def already_posted(ledger: dict[str, str], event_id: str) -> bool:
     return event_id in ledger
+
 
 def mark_posted(ledger: dict[str, str], event_id: str) -> None:
     ledger[event_id] = _now_iso()

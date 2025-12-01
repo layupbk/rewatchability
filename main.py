@@ -81,6 +81,7 @@ NAME_TO_INPRED: Dict[str, str] = {
 # Date logic – 8:59 AM PT cutoff
 # ----------------------------------------------------------------------
 
+
 def _today_iso_local() -> str:
     """
     Game-day date in Los Angeles time as YYYY-MM-DD.
@@ -109,6 +110,7 @@ def _format_date(date_iso: str) -> str:
 # ----------------------------------------------------------------------
 # Formatting
 # ----------------------------------------------------------------------
+
 
 def _format_block(
     game: Dict[str, Any],
@@ -155,6 +157,7 @@ def _format_block(
 # League processing
 # ----------------------------------------------------------------------
 
+
 def _process_league(
     sport: str,
     date_iso: str,
@@ -188,7 +191,15 @@ def _process_league(
     all_final_flag = all(g.get("is_final") for g in games)
 
     # Excitement from Inpredictable PreCap (cached inside module)
-    excite_map = fetch_excitement_map(sport_up)
+    try:
+        excite_map = fetch_excitement_map(sport_up)
+    except Exception as ex:
+        print(
+            f"[INPRED ERROR] {sport_up} {date_iso}: {ex}. "
+            "Proceeding with empty Excitement map.",
+            flush=True,
+        )
+        excite_map = {}
 
     # Keep all scored outcomes + track finals missing EI
     scored_rows: List[Tuple[Dict[str, Any], int, Optional[float], bool]] = []
@@ -286,12 +297,17 @@ def _process_league(
         scored_rows,
         key=lambda tup: tup[1],
     )
+    best_id = best_game.get("id")
+    if not best_id:
+        print(
+            f"[FALLBACK] {sport_up} {date_iso}: cannot determine best game id.",
+            flush=True,
+        )
+        return
 
-    best_id = best_game["id"]
     if already_posted(ledger, best_id):
         print(
-            f"[FALLBACK] {sport_up} {date_iso}: top game {best_id} "
-            "already posted.",
+            f"[FALLBACK] {sport_up} {date_iso}: top game {best_id} already posted.",
             flush=True,
         )
         return
@@ -313,6 +329,7 @@ def _process_league(
 # ----------------------------------------------------------------------
 # Main loop
 # ----------------------------------------------------------------------
+
 
 def run() -> None:
     print("[RUN] starting Rewatchability autopilot (basketball only)", flush=True)

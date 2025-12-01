@@ -20,7 +20,7 @@ import requests
 NBA_PRECAP_URL = "https://stats.inpredictable.com/nba/preCap.php"
 WNBA_PRECAP_URL = "https://stats.inpredictable.com/wnba/preCap.php"
 
-PRECAP_URLS = {
+PRECAP_URLS: Dict[str, str] = {
     "NBA": NBA_PRECAP_URL,
     "WNBA": WNBA_PRECAP_URL,
 }
@@ -129,7 +129,7 @@ def _get_cached_mapping(league_up: str) -> Optional[Dict[Tuple[str, str], float]
     mapping = entry.get("mapping")
     if not isinstance(mapping, dict) or not isinstance(ts, (int, float)):
         return None
-    if (time.time() - ts) > CACHE_TTL_SECONDS:
+    if (time.time() - float(ts)) > CACHE_TTL_SECONDS:
         return None
     return mapping  # still fresh
 
@@ -154,17 +154,20 @@ def fetch_excitement_map(league: str) -> Dict[Tuple[str, str], float]:
 
     url = PRECAP_URLS[league_up]
 
-    html = _fetch_precap_html(url)
-    if html:
-        mapping = _parse_precap_table(html)
-        if mapping:
-            _set_cached_mapping(league_up, mapping)
-            _log(f"parsed {len(mapping)} finished games from PreCap for {league_up}")
-            return mapping
+    try:
+        html = _fetch_precap_html(url)
+        if html:
+            mapping = _parse_precap_table(html)
+            if mapping:
+                _set_cached_mapping(league_up, mapping)
+                _log(f"parsed {len(mapping)} finished games from PreCap for {league_up}")
+                return mapping
+            else:
+                _log(f"parsed 0 finished games from PreCap for {league_up}")
         else:
-            _log(f"parsed 0 finished games from PreCap for {league_up}")
-    else:
-        _log(f"no HTML from PreCap for {league_up}")
+            _log(f"no HTML from PreCap for {league_up}")
+    except Exception as ex:
+        _log(f"unexpected error in fetch_excitement_map({league_up}): {ex}")
 
     # Fallback: use cached mapping if available
     cached = _get_cached_mapping(league_up)
