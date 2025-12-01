@@ -1,198 +1,192 @@
 # inpredictable.py
-# Scraper for inpredictable.com's PreCap "Excitement" tables.
 #
-# Supports:
-#   - NBA  -> https://stats.inpredictable.com/nba/preCap.php
-#   - WNBA -> https://stats.inpredictable.com/wnba/preCap.php
+# Fetches Excitement Index (EI) from Inpredictable's PreCap page and returns
+# a mapping keyed by ESPN-style team abbreviations.
 #
-# Public API:
-#   fetch_excitement_map("NBA")  -> dict[(away_abbrev, home_abbrev), excitement_float]
-#   fetch_excitement_map("WNBA") -> same, for WNBA
+# Supports: NBA PreCap via stats.inpredictable.com
+# WNBA: returns an empty map for now (no official PreCap).
 
 from __future__ import annotations
 
 import re
 import time
-from typing import Dict, Tuple, Optional
+from typing import Dict, Tuple
 
 import requests
 
-NBA_PRECAP_URL = "https://stats.inpredictable.com/nba/preCap.php"
-WNBA_PRECAP_URL = "https://stats.inpredictable.com/wnba/preCap.php"
+# Official PreCap page for yesterday's NBA games.
+# (This page always shows the most recent completed NBA slate.)
+NBA_PRECAP_URL = "https://stats.inpredictable.com/nba/preCapOld.php"
 
-PRECAP_URLS: Dict[str, str] = {
-    "NBA": NBA_PRECAP_URL,
-    "WNBA": WNBA_PRECAP_URL,
-}
+# If/when you add WNBA support, you can point this at a WNBA PreCap equivalent.
+WNBA_PRECAP_URL = None  # placeholder
 
-# Simple in-process cache:
-#   league -> {"ts": float, "mapping": dict[(away,home)->float]}
-_CACHE: Dict[str, Dict[str, object]] = {}
-CACHE_TTL_SECONDS = 120.0  # reuse for a couple of minutes
+# Simple in-memory cache so we don't hammer Inpredictable unnecessarily
+_CACHE: Dict[str, Dict[Tuple[str, str], float]] = {}
+_CACHE_TS: Dict[str, float] = {}
+_CACHE_TTL_SECONDS = 30 * 60  # 30 minutes
 
 
 def _log(msg: str) -> None:
     print(f"[INPRED] {msg}", flush=True)
 
 
-def _fetch_precap_html(url: str) -> Optional[str]:
-    """Fetch raw HTML from the PreCap page."""
-    try:
-        resp = requests.get(url, timeout=10)
-    except Exception as ex:
-        _log(f"error fetching {url}: {ex}")
-        return None
-
-    if resp.status_code != 200:
-        _log(f"GET {url} -> {resp.status_code}")
-        return None
-
-    resp.encoding = "utf-8"
+def _fetch_raw_html(url: str) -> str:
+    resp = requests.get(url, timeout=10)
+    resp.raise_for_status()
     return resp.text
 
 
-def _html_to_text(html: str) -> str:
+def _extract_main_table(html: str) -> str:
     """
-    Very simple HTML → text converter:
-    - Turn <br> into newlines
-    - Drop all tags
-    - Normalize spaces
+    The PreCap page has a TON of Blogger/JS noise. We only want the chunk
+    between the 'Rank Game Status Excitement...' header and 'League Averages'.
+    This also avoids bogus matches like 'SON @ ONE' in script tags.
     """
-    # 1) <br> -> newline so each row can live on its own line
-    text = re.sub(r"<br\s*/?>", "\n", html, flags=re.IGNORECASE)
+    header = "Rank Game Status Excitement"
+    footer = "League Averages"
 
-    # 2) Strip any remaining HTML tags
-    text = re.sub(r"<[^>]+>", " ", text)
+    start = html.find(header)
+    if start == -1:
+        _log("could not locate PreCap table header")
+        return ""
 
-    # 3) Normalize non-breaking spaces, collapse extra spaces
-    text = text.replace("\xa0", " ")
-    text = re.sub(r"[ \t]+", " ", text)
+    end = html.find(footer, start)
+    if end == -1:
+        end = len(html)
 
-    return text
+    return html[start:end]
 
 
-def _parse_precap_table(html: str) -> Dict[Tuple[str, str], float]:
+def _parse_pre_cap_table(league: str, html: str) -> Dict[Tuple[str, str], float]:
     """
-    Return {(away_abbr, home_abbr): excitement_float} for games.
-
-    Strategy:
-      - Convert HTML to plain text.
-      - In the whole text, look for patterns like:
-
-            ATL @ PHI ... Finished 13.7
-            OKC @ POR ... Finished 8.2
-            ...
-
-        where the 'Finished X.Y' part can be on the same line or later.
+    Parse the PreCap table and return a mapping:
+        (AWAY_ESPN_ABBR, HOME_ESPN_ABBR) -> excitement (float)
     """
-    rows: Dict[Tuple[str, str], float] = {}
+    table = _extract_main_table(html)
+    if not table:
+        return {}
 
-    if not html:
-        return rows
+    _log(f"PreCap text length = {len(html)} chars")
 
-    text = _html_to_text(html)
-    _log(f"PreCap text length = {len(text)} chars")
-
-    # Robust pattern:
-    #   AWAY(3) @ HOME(3) ... Finished <float>
-    #
-    # DOTALL so 'Finished' can be across a newline or separated by other text.
-    pattern = re.compile(
-        r"([A-Z]{3})\s*@\s*([A-Z]{3}).*?Finished\s+(\d+(\.\d+)?)",
-        re.IGNORECASE | re.DOTALL,
+    # Pattern (within the table chunk) looks roughly like:
+    #   1  ATL @ PHI  ... Finished 13.7  82% ...
+    row_pattern = re.compile(
+        r"\b\d+\s*([A-Z]{2,3})\s*@\s*([A-Z]{2,3}).*?Finished\s+([\d.]+)",
+        re.DOTALL,
     )
 
-    count_finished = 0
-    debug_shown = 0
+    results: Dict[Tuple[str, str], float] = {}
 
-    for m in pattern.finditer(text):
-        away = m.group(1).upper()
-        home = m.group(2).upper()
-        excite_str = m.group(3)
+    for match in row_pattern.finditer(table):
+        away_abbr_raw, home_abbr_raw, ei_str = match.groups()
+        away_pre = away_abbr_raw.strip()
+        home_pre = home_abbr_raw.strip()
 
         try:
-            excite_val = float(excite_str)
+            excitement = float(ei_str)
         except ValueError:
             continue
 
-        rows[(away, home)] = excite_val
-        count_finished += 1
+        # In NBA, Inpredictable and ESPN abbreviations generally match.
+        # For WNBA, you'd add mapping here if/when you parse WNBA PreCap.
+        away_espn = _normalize_abbr(league, away_pre)
+        home_espn = _normalize_abbr(league, home_pre)
 
-        # Log a few sample rows so we can see what is being parsed
-        if debug_shown < 10:
-            snippet = text[max(0, m.start() - 40) : m.end() + 40]
-            snippet = snippet.replace("\n", " ")
-            _log(
-                f"ROW parsed: {away} @ {home} -> Excitement {excite_val} "
-                f"(context=...{snippet}...)"
-            )
-            debug_shown += 1
+        results[(away_espn, home_espn)] = excitement
 
-    _log(f"parsed {count_finished} finished games from PreCap table")
-    return rows
+        # Keep logging tiny & readable (no giant HTML dump).
+        _log(f"ROW parsed: {away_espn} @ {home_espn} -> Excitement {excitement}")
+
+    _log(f"parsed {len(results)} finished games from PreCap for {league}")
+    return results
 
 
-def _get_cached_mapping(league_up: str) -> Optional[Dict[Tuple[str, str], float]]:
-    """Read from in-process cache if still fresh."""
-    entry = _CACHE.get(league_up)
-    if not entry:
+def _normalize_abbr(league: str, abbr: str) -> str:
+    """
+    Map Inpredictable's team abbreviation to the ESPN abbreviation that
+    the scoreboard uses. For NBA they already match; for WNBA there are
+    known differences (NYL vs NY, LVA vs LV, etc.) if/when you wire it up.
+    """
+    league = league.upper()
+
+    if league == "WNBA":
+        # When you add WNBA PreCap parsing, fill this out, e.g.:
+        # mapping = {
+        #     "NYL": "NY",   # Liberty
+        #     "LVA": "LV",   # Aces
+        #     "LAS": "LA",   # Sparks
+        # }
+        mapping = {}
+        return mapping.get(abbr, abbr)
+
+    # Default: NBA – already aligned
+    return abbr
+
+
+def _get_cache_key(league: str) -> str:
+    # For now, PreCapOld is "yesterday's games", so we just cache by league.
+    return league.upper()
+
+
+def _get_from_cache(league: str) -> Dict[Tuple[str, str], float] | None:
+    key = _get_cache_key(league)
+    ts = _CACHE_TS.get(key)
+    if ts is None:
         return None
-
-    ts = entry.get("ts")
-    mapping = entry.get("mapping")
-    if not isinstance(mapping, dict) or not isinstance(ts, (int, float)):
+    if time.time() - ts > _CACHE_TTL_SECONDS:
         return None
-
-    if (time.time() - float(ts)) > CACHE_TTL_SECONDS:
-        return None
-
-    return mapping  # still fresh
+    return _CACHE.get(key)
 
 
-def _set_cached_mapping(league_up: str, mapping: Dict[Tuple[str, str], float]) -> None:
-    _CACHE[league_up] = {"ts": time.time(), "mapping": mapping}
+def _set_cache(league: str, mapping: Dict[Tuple[str, str], float]) -> None:
+    key = _get_cache_key(league)
+    _CACHE[key] = mapping
+    _CACHE_TS[key] = time.time()
 
 
 def fetch_excitement_map(league: str) -> Dict[Tuple[str, str], float]:
     """
-    Return a dict mapping (away_abbr, home_abbr) -> inpredictable Excitement (raw).
+    Public entry point.
 
-    Behavior:
-      - Try to fetch and parse the current PreCap page.
-      - If it yields a non-empty mapping, cache it and return.
-      - If it fails or parses to empty, fall back to a recent cached mapping
-        (if available) instead of returning {}.
+    Returns:
+        dict keyed by (AWAY_ESPN_ABBR, HOME_ESPN_ABBR) -> excitement float
+
+    NOTE: This intentionally ignores the date argument that used to exist.
+    PreCapOld always shows the most recent complete slate (i.e., "yesterday"),
+    which matches how the autopilot uses it.
     """
-    league_up = (league or "").upper()
-    if league_up not in PRECAP_URLS:
-        raise ValueError(f"Unsupported league for inpredictable PreCap: {league!r}")
+    league_up = league.upper()
 
-    url = PRECAP_URLS[league_up]
-
-    try:
-        html = _fetch_precap_html(url)
-        if html:
-            mapping = _parse_precap_table(html)
-            if mapping:
-                _set_cached_mapping(league_up, mapping)
-                _log(f"parsed {len(mapping)} finished games from PreCap for {league_up}")
-                return mapping
-            else:
-                _log(f"parsed 0 finished games from PreCap for {league_up}")
-        else:
-            _log(f"no HTML from PreCap for {league_up}")
-    except Exception as ex:
-        _log(f"unexpected error in fetch_excitement_map({league_up}): {ex}")
-
-    # Fallback: use cached mapping if available
-    cached = _get_cached_mapping(league_up)
-    if cached:
-        _log(
-            f"using cached Excitement mapping for {league_up} "
-            f"(len={len(cached)})"
-        )
+    # Cache hit?
+    cached = _get_from_cache(league_up)
+    if cached is not None:
         return cached
 
-    # Nothing available
-    _log(f"no Excitement data available (live or cache) for {league_up}")
-    return {}
+    if league_up == "NBA":
+        url = NBA_PRECAP_URL
+    elif league_up == "WNBA":
+        # No WNBA PreCap yet – just return an empty mapping.
+        _log("WNBA PreCap not configured; returning empty map.")
+        _set_cache(league_up, {})
+        return {}
+    else:
+        _log(f"Unsupported league for PreCap: {league_up}")
+        _set_cache(league_up, {})
+        return {}
+
+    _log(f"fetching PreCap for {league_up} via {url}")
+
+    try:
+        html = _fetch_raw_html(url)
+        mapping = _parse_pre_cap_table(league_up, html)
+        _set_cache(league_up, mapping)
+        return mapping
+    except Exception as ex:
+        _log(f"ERROR fetching PreCap for {league_up}: {ex}")
+        # If we have a stale cache, prefer that to total failure
+        stale = _CACHE.get(_get_cache_key(league_up))
+        if stale:
+            _log(f"using stale cached PreCap for {league_up}")
+            return stale
+        return {}
