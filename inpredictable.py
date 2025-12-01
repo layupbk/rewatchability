@@ -1,126 +1,120 @@
 # inpredictable.py
-# Scraper for inpredictable.com's PreCap "Excitement" tables.
+# Scraper for inpredictable.com's PreCap "Excitement" tables, with per-date caching.
 #
 # Supports:
 #   - NBA  -> https://stats.inpredictable.com/nba/preCap.php
 #   - WNBA -> https://stats.inpredictable.com/wnba/preCap.php
 #
 # Public API:
-#   fetch_excitement_map("NBA")  -> dict[(away_abbrev, home_abbrev), excitement_float]
-#   fetch_excitement_map("WNBA") -> same, for WNBA
+#   fetch_excitement_map("NBA",  "2025-11-30")
+#   fetch_excitement_map("WNBA", "2025-11-30")
+#
+# Returns:
+#   dict[(away_abbrev, home_abbrev), excitement_float]
 
 from __future__ import annotations
 
 import re
-import time
-from typing import Dict, Tuple
+import datetime
+from typing import Dict, Tuple, Optional
 
 import requests
 
 NBA_PRECAP_URL = "https://stats.inpredictable.com/nba/preCap.php"
 WNBA_PRECAP_URL = "https://stats.inpredictable.com/wnba/preCap.php"
 
-PRECAP_URLS = {
+PRECAP_URLS: Dict[str, str] = {
     "NBA": NBA_PRECAP_URL,
     "WNBA": WNBA_PRECAP_URL,
 }
 
+# Parse strings like "DET @ BOS" (possibly with extra junk after them)
+GAME_CELL_RE = re.compile(
+    r"""
+    ^\s*
+    (?P<away>[A-Z]{2,4})      # away team abbreviation
+    \s*@\s*
+    (?P<home>[A-Z]{2,4})      # home team abbreviation
+    """,
+    re.VERBOSE,
+)
 
-def _fetch_precap_html(url: str, attempts: int = 3, timeout: int = 20) -> str | None:
-    """
-    Fetch the raw HTML for a PreCap page, with retries.
+# Per-(league, date_iso) cache: (league_up, date_iso) -> {"mapping": dict, "fetched_at": datetime}
+_CACHE: Dict[Tuple[str, str], Dict[str, object]] = {}
 
-    - attempts: how many times to retry on network/timeout errors.
-    - timeout: seconds per individual HTTP request.
-    """
-    last_exc: Exception | None = None
 
-    for attempt in range(1, attempts + 1):
-        try:
-            resp = requests.get(url, timeout=timeout)
-            if resp.status_code != 200:
-                print(
-                    f"[INPRED] GET {url} -> {resp.status_code} on attempt "
-                    f"{attempt}/{attempts}",
-                    flush=True,
-                )
-                last_exc = RuntimeError(f"HTTP {resp.status_code}")
-            else:
-                resp.encoding = "utf-8"
-                return resp.text
-        except Exception as ex:
-            last_exc = ex
-            print(
-                f"[INPRED] error fetching {url} on attempt "
-                f"{attempt}/{attempts}: {ex}",
-                flush=True,
-            )
+def _log(msg: str) -> None:
+    print(f"[INPRED] {msg}", flush=True)
 
-        if attempt < attempts:
-            time.sleep(3)  # brief pause before trying again
 
-    print(
-        f"[INPRED] giving up after {attempts} attempts for {url}: {last_exc}",
-        flush=True,
-    )
-    return None
+def _fetch_precap_html(url: str) -> Optional[str]:
+    try:
+        resp = requests.get(url, timeout=10)
+        if resp.status_code != 200:
+            _log(f"GET {url} -> {resp.status_code}")
+            return None
+        resp.encoding = "utf-8"
+        return resp.text
+    except Exception as ex:
+        _log(f"error fetching {url}: {ex}")
+        return None
 
 
 def _parse_precap_table(html: str) -> Dict[Tuple[str, str], float]:
     """
     Return {(away_abbr, home_abbr): excitement_float} for games
-    where the row text includes 'Finished'.
-
-    Approach:
-      1. Replace <br> with spaces.
-      2. Strip all remaining HTML tags.
-      3. Collapse whitespace.
-      4. Scan the entire text for patterns like:
-         RANK AWAY @ HOME ... Finished ... EXCITE
-      5. Only keep rows whose middle segment contains 'finished'.
+    where Status == "Finished".
     """
     rows: Dict[Tuple[str, str], float] = {}
 
-    # 1) Normalize <br> tags to spaces
-    text = re.sub(r"<br\s*/?>", " ", html, flags=re.IGNORECASE)
+    # Normalize <br> variations to spaces for easier regex parsing.
+    cleaned = re.sub(r"<br\s*/?>", " ", html, flags=re.IGNORECASE)
 
-    # 2) Strip ALL other HTML tags
-    text = re.sub(r"<[^>]+>", " ", text)
+    # Anchor around the header line.
+    header_match = re.search(
+        r"Rank\s*Game\s*Status\s*Excitement\s*Tension",
+        cleaned,
+        flags=re.IGNORECASE,
+    )
+    if not header_match:
+        return rows
 
-    # 3) Collapse whitespace down to single spaces
-    text = re.sub(r"\s+", " ", text).strip()
+    table_text = cleaned[header_match.end() :]
 
-    # Pattern:
-    #   rank (digits)
-    #   away (2–4 uppercase letters)
-    #   '@'
-    #   home (2–4 uppercase letters)
-    #   status_block (non-digit text, which should contain 'Finished', 'In Progress', etc.)
-    #   excite (number)
-    #
-    # Example (after cleaning):
-    #   "1 ATL @ PHI Finished 13.7 82% 38.1 +65.0%"
-    pattern = re.compile(
-        r"(?P<rank>\d+)\s+"
-        r"(?P<away>[A-Z]{2,4})\s*@\s*(?P<home>[A-Z]{2,4})\s+"
-        r"(?P<status_block>[^0-9]+?)\s+"
-        r"(?P<excite>\d+(\.\d+)?)",
-        re.IGNORECASE,
+    game_pattern = re.compile(
+        r"""
+        (?P<rank>\d+)
+        \s+
+        (?P<game>[A-Z]{2,4}\s*@\s*[A-Z]{2,4}[^0-9\n]*?)
+        \s+
+        (?P<status>Finished|In\ Progress|Scheduled)
+        \s+
+        (?P<excite>\d+(\.\d+)?)
+        """,
+        re.VERBOSE | re.IGNORECASE,
     )
 
-    for m in pattern.finditer(text):
-        status_block = m.group("status_block") or ""
-        # Only use rows where the status block contains 'finished'
-        if "finished" not in status_block.lower():
+    for m in game_pattern.finditer(table_text):
+        status = m.group("status").strip().lower()
+        if status != "finished":
+            # We only want completed games for EI.
             continue
 
-        away = m.group("away").upper()
-        home = m.group("home").upper()
-
+        game_cell = m.group("game")
         excite_str = m.group("excite")
+
+        if not excite_str:
+            continue
+
+        gm = GAME_CELL_RE.search(game_cell)
+        if not gm:
+            continue
+        away = gm.group("away").upper()
+        home = gm.group("home").upper()
+
         try:
             excite = float(excite_str)
-        except (TypeError, ValueError):
+        except ValueError:
             continue
 
         rows[(away, home)] = excite
@@ -128,23 +122,59 @@ def _parse_precap_table(html: str) -> Dict[Tuple[str, str], float]:
     return rows
 
 
-def fetch_excitement_map(league: str) -> Dict[Tuple[str, str], float]:
+def fetch_excitement_map(league: str, date_iso: str) -> Dict[Tuple[str, str], float]:
     """
-    Return a dict mapping (away_abbr, home_abbr) -> inpredictable Excitement (raw).
+    Return a dict mapping (away_abbr, home_abbr) -> inpredictable Excitement (raw),
+    with per-(league, date_iso) caching.
+
+    Behavior:
+      - Try to pull the PreCap page and parse it.
+      - If we get a non-empty mapping, we cache and return it.
+      - If the fetch fails OR parses to zero finished games, we fall back to
+        the last cached mapping for that (league, date_iso) if it exists.
+      - Otherwise we return {}.
     """
     league_up = (league or "").upper()
     if league_up not in PRECAP_URLS:
         raise ValueError(f"Unsupported league for inpredictable PreCap: {league!r}")
 
+    cache_key = (league_up, date_iso)
     url = PRECAP_URLS[league_up]
-    html = _fetch_precap_html(url)
-    if not html:
-        # We already logged why it failed; return empty so caller can "WAIT".
-        return {}
 
-    mapping = _parse_precap_table(html)
-    print(
-        f"[INPRED] parsed {len(mapping)} finished games from PreCap for {league_up}",
-        flush=True,
-    )
-    return mapping
+    html = _fetch_precap_html(url)
+    if html:
+        mapping = _parse_precap_table(html)
+        if mapping:
+            _CACHE[cache_key] = {
+                "mapping": mapping,
+                "fetched_at": datetime.datetime.utcnow(),
+            }
+            _log(
+                f"parsed {len(mapping)} finished games from PreCap for {league_up} "
+                f"({date_iso})"
+            )
+            return mapping
+        else:
+            _log(
+                f"parsed 0 finished games from PreCap for {league_up} ({date_iso}); "
+                "will try cache if available."
+            )
+    else:
+        _log(
+            f"no HTML from PreCap for {league_up} ({date_iso}); "
+            "will try cache if available."
+        )
+
+    # Fallback to cache for this league+date if we have one
+    cached = _CACHE.get(cache_key)
+    if cached and isinstance(cached.get("mapping"), dict):
+        mapping = cached["mapping"]  # type: ignore[assignment]
+        _log(
+            f"using cached mapping with {len(mapping)} games for {league_up} "
+            f"({date_iso})"
+        )
+        return mapping  # type: ignore[return-value]
+
+    # No data from HTML and no cache.
+    _log(f"no PreCap data or cache for {league_up} ({date_iso})")
+    return {}

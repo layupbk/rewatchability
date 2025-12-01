@@ -1,4 +1,5 @@
 # main.py — Basketball-only, Inpredictable EI, ESPN scoreboard, clean formatting
+
 import os
 import time
 import datetime
@@ -76,7 +77,6 @@ NAME_TO_INPRED: Dict[str, str] = {
     "Sun": "CON",
 }
 
-
 # ----------------------------------------------------------------------
 # Date logic – 8:59 AM PT cutoff
 # ----------------------------------------------------------------------
@@ -87,7 +87,7 @@ def _today_iso_local() -> str:
 
     Rule:
       - From midnight up to 8:59 AM PT, we still consider the "game day"
-        to be *yesterday* (to catch all late games + late EI updates).
+        to be *yesterday* (to catch all late games + EI updates).
       - From 9:00 AM PT onward, the game day is *today*.
     """
     now = datetime.datetime.now(LOCAL_TZ)
@@ -166,7 +166,7 @@ def _process_league(
 
     Flow:
       - Get ESPN scoreboard (no preseason – handled in espn_adapter).
-      - Pull Excitement map from inpredictable (PreCap).
+      - Pull Excitement map from inpredictable (PreCap), *per date* with caching.
       - For every FINAL game:
           * Map ESPN team names -> Inpredictable codes
           * Look up Excitement
@@ -175,6 +175,8 @@ def _process_league(
           * Print block for EVERY game (posted or recap)
       - Fallback: if *no* game is national/70+ and all games are final & have EI,
         post the single top game.
+      - "Retry until EI appears" happens naturally: each loop re-fetches EI and
+        we only fallback once every final has EI.
     """
     sport_up = sport.upper()
     print(f"[LOOP] checking {sport_up} for {date_iso}", flush=True)
@@ -188,8 +190,8 @@ def _process_league(
     # Are all games for this date & league final (per ESPN)?
     all_final_flag = all(g.get("is_final") for g in games)
 
-    # Excitement from Inpredictable PreCap
-    excite_map = fetch_excitement_map(sport_up)
+    # Excitement from Inpredictable PreCap (per league + date, with caching)
+    excite_map = fetch_excitement_map(sport_up, date_iso)
 
     # Keep all scored outcomes + track finals missing EI
     scored_rows: List[Tuple[Dict[str, Any], int, Optional[float], bool]] = []
@@ -218,7 +220,7 @@ def _process_league(
             )
 
         # Score: if EI missing, we still compute score from 0 for display,
-        # but we will not use that game for fallback until EI is present.
+        # but we do *not* use that game for fallback until EI is present.
         raw_for_scoring = excite_raw if excite_raw is not None else 0.0
         result = score_game(sport_up, raw_for_scoring)
         score_val = result.score
