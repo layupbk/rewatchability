@@ -69,10 +69,15 @@ def _fetch_precap_html(url: str, attempts: int = 3, timeout: int = 20) -> str | 
 def _parse_precap_table(html: str) -> Dict[Tuple[str, str], float]:
     """
     Return {(away_abbr, home_abbr): excitement_float} for games
-    where Status == "Finished".
+    where the row text includes 'Finished'.
 
-    We first strip HTML tags down to plain text so the regex works
-    reliably even if there are links, images, etc. in the Game column.
+    Approach:
+      1. Replace <br> with spaces.
+      2. Strip all remaining HTML tags.
+      3. Collapse whitespace.
+      4. Scan the entire text for patterns like:
+         RANK AWAY @ HOME ... Finished ... EXCITE
+      5. Only keep rows whose middle segment contains 'finished'.
     """
     rows: Dict[Tuple[str, str], float] = {}
 
@@ -82,37 +87,31 @@ def _parse_precap_table(html: str) -> Dict[Tuple[str, str], float]:
     # 2) Strip ALL other HTML tags
     text = re.sub(r"<[^>]+>", " ", text)
 
-    # 3) Collapse whitespace
+    # 3) Collapse whitespace down to single spaces
     text = re.sub(r"\s+", " ", text).strip()
 
-    # Find the header row that starts the main table
-    header_match = re.search(
-        r"Rank\s+Game\s+Status\s+Excitement\s+Tension",
-        text,
-        flags=re.IGNORECASE,
-    )
-    if not header_match:
-        return rows
-
-    table_text = text[header_match.end() :]
-
-    # Example line (after stripping tags & collapsing spaces):
-    # "1 ATL @ PHI Finished 13.7 82% 38.1 +65.0%"
+    # Pattern:
+    #   rank (digits)
+    #   away (2–4 uppercase letters)
+    #   '@'
+    #   home (2–4 uppercase letters)
+    #   status_block (non-digit text, which should contain 'Finished', 'In Progress', etc.)
+    #   excite (number)
     #
-    # Sometimes there may be an "Image" token or similar between the
-    # game and the status, so we allow one optional word there.
-    game_pattern = re.compile(
+    # Example (after cleaning):
+    #   "1 ATL @ PHI Finished 13.7 82% 38.1 +65.0%"
+    pattern = re.compile(
         r"(?P<rank>\d+)\s+"
         r"(?P<away>[A-Z]{2,4})\s*@\s*(?P<home>[A-Z]{2,4})\s+"
-        r"(?:\S+\s+)?"
-        r"(?P<status>Finished|In Progress|Scheduled)\s+"
+        r"(?P<status_block>[^0-9]+?)\s+"
         r"(?P<excite>\d+(\.\d+)?)",
         re.IGNORECASE,
     )
 
-    for m in game_pattern.finditer(table_text):
-        status = m.group("status").strip().lower()
-        if status != "finished":
+    for m in pattern.finditer(text):
+        status_block = m.group("status_block") or ""
+        # Only use rows where the status block contains 'finished'
+        if "finished" not in status_block.lower():
             continue
 
         away = m.group("away").upper()
