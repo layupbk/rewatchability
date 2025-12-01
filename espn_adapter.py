@@ -1,213 +1,183 @@
-# espn_adapter.py
-# ESPN scoreboard adapter for Rewatchability (basketball-only).
+# inpredictable.py
+# Scraper for inpredictable.com's PreCap "Excitement" tables.
+#
+# Supports:
+#   - NBA  -> https://stats.inpredictable.com/nba/preCap.php
+#   - WNBA -> https://stats.inpredictable.com/wnba/preCap.php
 #
 # Public API:
-#   get_scoreboard(league_key: str, date_iso: str) -> list[dict]
-#
-# Returns a list of games shaped like:
-#   {
-#       "id": str,            # ESPN event id
-#       "away": str,          # e.g. "Celtics"
-#       "home": str,          # e.g. "Lakers"
-#       "is_final": bool,     # True if completed/final
-#       "broadcast": str,     # national network or "" if local/none
-#   }
+#   fetch_excitement_map("NBA")  -> dict[(away_abbrev, home_abbrev), excitement_float]
+#   fetch_excitement_map("WNBA") -> same, for WNBA
 
 from __future__ import annotations
 
-import os
-from typing import Final, Dict, Any, List, Optional
+import re
+import time
+from typing import Dict, Tuple, Optional
 
 import requests
 
-DEBUG: bool = os.getenv("DEBUG_ESPN", "1").lower() not in ("0", "false", "no")
-TIMEOUT: float = float(os.getenv("ESPN_TIMEOUT", "8.0"))
+NBA_PRECAP_URL = "https://stats.inpredictable.com/nba/preCap.php"
+WNBA_PRECAP_URL = "https://stats.inpredictable.com/wnba/preCap.php"
 
-USER_AGENT: Final[str] = (
-    "Mozilla/5.0 (compatible; RewatchabilityBot/1.0; +https://rewatchability)"
+PRECAP_URLS: Dict[str, str] = {
+    "NBA": NBA_PRECAP_URL,
+    "WNBA": WNBA_PRECAP_URL,
+}
+
+# Parse strings like "DET @ BOS" (possibly with extra junk after them)
+GAME_CELL_RE = re.compile(
+    r"""
+    ^\s*
+    (?P<away>[A-Z]{2,4})      # away team abbreviation
+    \s*@\s*
+    (?P<home>[A-Z]{2,4})      # home team abbreviation
+    """,
+    re.VERBOSE,
 )
 
-HEADERS: Final[Dict[str, str]] = {
-    "User-Agent": USER_AGENT,
-    "Accept": "application/json, text/plain, */*",
-    "Accept-Language": "en-US,en;q=0.9",
-    "Connection": "keep-alive",
-}
-
-# key -> (sport_path, league_path)
-LEAGUE_PATH: Final[Dict[str, tuple[str, str]]] = {
-    "NBA": ("basketball", "nba"),
-    "WNBA": ("basketball", "wnba"),
-}
-
-# Optional override of scoreboard base URLs (comma-separated)
-SCOREBOARD_TEMPLATES_ENV = os.getenv("ESPN_SCOREBOARD_BASES")
+# Simple in-process cache:
+#   league -> {"ts": float, "mapping": dict[(away,home)->float]}
+_CACHE: Dict[str, Dict[str, object]] = {}
+CACHE_TTL_SECONDS = 120.0  # okay to re-use for a couple of minutes
 
 
 def _log(msg: str) -> None:
-    if DEBUG:
-        print(f"[ESPN] {msg}", flush=True)
+    print(f"[INPRED] {msg}", flush=True)
 
 
-def _scoreboard_templates() -> List[str]:
-    """
-    List of scoreboard base URLs with {sport} and {league} placeholders.
-
-    If ESPN_SCOREBOARD_BASES is set, use that (comma-separated).
-    Otherwise, use known-good defaults.
-    """
-    if SCOREBOARD_TEMPLATES_ENV:
-        tmpls = [t.strip() for t in SCOREBOARD_TEMPLATES_ENV.split(",") if t.strip()]
-        if tmpls:
-            return tmpls
-
-    # Defaults: site.api and site.web.api variants
-    return [
-        "https://site.api.espn.com/apis/site/v2/sports/{sport}/{league}/scoreboard",
-        "https://site.web.api.espn.com/apis/site/v2/sports/{sport}/{league}/scoreboard",
-    ]
-
-
-def _scoreboard_urls(league_key: str) -> List[str]:
-    sport, league = LEAGUE_PATH[league_key]
-    return [tmpl.format(sport=sport, league=league) for tmpl in _scoreboard_templates()]
-
-
-def _get(url: str, params: Optional[Dict[str, Any]] = None) -> Optional[Dict[str, Any]]:
+def _fetch_precap_html(url: str) -> Optional[str]:
     try:
-        r = requests.get(url, headers=HEADERS, params=params, timeout=TIMEOUT)
-        if not r.ok:
-            _log(f"[DEBUG] GET {url} params={params} -> {r.status_code}")
+        resp = requests.get(url, timeout=10)
+        if resp.status_code != 200:
+            _log(f"GET {url} -> {resp.status_code}")
             return None
-        return r.json()
-    except Exception as e:
-        _log(f"[DEBUG] GET error for {url}: {e}")
+        resp.encoding = "utf-8"
+        return resp.text
+    except Exception as ex:
+        _log(f"error fetching {url}: {ex}")
         return None
 
 
-def _espn_date_param(date_iso: str) -> str:
+def _parse_precap_table(html: str) -> Dict[Tuple[str, str], float]:
     """
-    ESPN supports both YYYYMMDD and YYYY-MM-DD; we use YYYYMMDD.
+    Return {(away_abbr, home_abbr): excitement_float} for games
+    where Status == "Finished".
     """
-    return date_iso.replace("-", "")
+    rows: Dict[Tuple[str, str], float] = {}
 
+    # Normalize line breaks
+    cleaned = re.sub(r"<br\s*/?>", " ", html, flags=re.IGNORECASE)
 
-def _is_final_status(status: Dict[str, Any]) -> bool:
-    """
-    Decide if an event is 'final-like' based on ESPN status.
-    """
-    t = status.get("type") or {}
-    if t.get("completed"):
-        return True
-    name = (t.get("name") or "").upper()
-    if name in ("STATUS_FINAL", "STATUS_FULL_TIME", "STATUS_POSTPONED"):
-        return True
-    return False
+    # Find the header row that introduces Rank/Game/Status/Excitement/Tension
+    header_match = re.search(
+        r"Rank\s*Game\s*Status\s*Excitement\s*Tension",
+        cleaned,
+        flags=re.IGNORECASE,
+    )
+    if not header_match:
+        return rows
 
+    table_text = cleaned[header_match.end() :]
 
-def _pick_team_name(team_obj: Dict[str, Any]) -> str:
-    """
-    Prefer the shortDisplayName (e.g. 'Celtics') but fall back to displayName.
-    """
-    name = (team_obj.get("shortDisplayName") or "").strip()
-    if not name:
-        name = (team_obj.get("displayName") or "").strip()
-    return name or "Unknown"
+    # Each row roughly: rank, game, status, excitement, tension, ...
+    game_pattern = re.compile(
+        r"""
+        (?P<rank>\d+)
+        \s*                               # <-- allow 0 or more spaces after rank
+        (?P<game>[A-Z]{2,4}\s*@\s*[A-Z]{2,4}[^0-9\n]*?)
+        \s+
+        (?P<status>Finished|In\ Progress|Scheduled)
+        \s+
+        (?P<excite>\d+(\.\d+)?)
+        """,
+        re.VERBOSE | re.IGNORECASE,
+    )
 
-
-def _pick_national_broadcast(comp: Dict[str, Any]) -> str:
-    """
-    Return a simple network string if the game has a national/international broadcast.
-    We just pick the first entry in the broadcast list, if any.
-    """
-    casts = comp.get("broadcasts") or []
-    if not casts:
-        return ""
-    b = casts[0]
-    name = (b.get("names") or b.get("shortName") or b.get("name") or "").strip()
-    # 'names' can be a list of strings
-    if isinstance(b.get("names"), list) and b["names"]:
-        name = str(b["names"][0]).strip()
-    return name
-
-
-def get_scoreboard(league_key: str, date_iso: str) -> List[Dict[str, Any]]:
-    """
-    Fetch ESPN scoreboard for the given league ("NBA" or "WNBA") and date (YYYY-MM-DD).
-
-    Returns a list of simplified game dicts:
-      - id
-      - away
-      - home
-      - is_final
-      - broadcast
-    """
-    league_key = (league_key or "").upper()
-    if league_key not in LEAGUE_PATH:
-        raise ValueError(f"Unsupported league_key for ESPN scoreboard: {league_key!r}")
-
-    date_param = _espn_date_param(date_iso)
-    urls = _scoreboard_urls(league_key)
-
-    data: Optional[Dict[str, Any]] = None
-    for u in urls:
-        params = {"dates": date_param}
-        d = _get(u, params=params)
-        if d and d.get("events"):
-            _log(
-                f"scoreboard OK for {league_key} on {date_iso} "
-                f"via {u} dates={date_param}"
-            )
-            data = d
-            break
-
-    if not data or not data.get("events"):
-        _log(f"[WARN] no scoreboard data for {league_key} on {date_iso}")
-        return []
-
-    games_out: List[Dict[str, Any]] = []
-    events = data.get("events") or []
-
-    for e in events:
-        comps = e.get("competitions") or []
-        if not comps:
+    for m in game_pattern.finditer(table_text):
+        status = m.group("status").strip().lower()
+        if status != "finished":
             continue
-        comp = comps[0]
 
-        # Skip preseason if season.type == 1 (when present)
-        season = comp.get("season") or e.get("season") or {}
-        if season.get("type") == 1:
-            continue  # preseason
+        game_cell = m.group("game")
+        excite_str = m.group("excite")
 
-        status = comp.get("status") or e.get("status") or {}
-        is_final = _is_final_status(status)
+        if not excite_str:
+            continue
 
-        # Extract teams
-        competitors = comp.get("competitors") or []
-        away_name = ""
-        home_name = ""
-        for c in competitors:
-            team = c.get("team") or {}
-            nm = _pick_team_name(team)
-            side = (c.get("homeAway") or "").lower()
-            if side == "home":
-                home_name = nm
-            elif side == "away":
-                away_name = nm
+        gm = GAME_CELL_RE.search(game_cell)
+        if not gm:
+            continue
+        away = gm.group("away").upper()
+        home = gm.group("home").upper()
 
-        event_id = str(e.get("id") or "")
+        try:
+            excite = float(excite_str)
+        except ValueError:
+            continue
 
-        broadcast = _pick_national_broadcast(comp)
+        rows[(away, home)] = excite
 
-        games_out.append(
-            {
-                "id": event_id,
-                "away": away_name,
-                "home": home_name,
-                "is_final": bool(is_final),
-                "broadcast": broadcast,
-            }
+    return rows
+
+
+def _get_cached_mapping(league_up: str) -> Optional[Dict[Tuple[str, str], float]]:
+    entry = _CACHE.get(league_up)
+    if not entry:
+        return None
+    ts = entry.get("ts")
+    mapping = entry.get("mapping")
+    if not isinstance(mapping, dict) or not isinstance(ts, (int, float)):
+        return None
+    if (time.time() - float(ts)) > CACHE_TTL_SECONDS:
+        return None
+    return mapping  # still fresh
+
+
+def _set_cached_mapping(league_up: str, mapping: Dict[Tuple[str, str], float]) -> None:
+    _CACHE[league_up] = {"ts": time.time(), "mapping": mapping}
+
+
+def fetch_excitement_map(league: str) -> Dict[Tuple[str, str], float]:
+    """
+    Return a dict mapping (away_abbr, home_abbr) -> inpredictable Excitement (raw).
+
+    Behavior:
+      - Try to fetch and parse the current PreCap page.
+      - If it yields a non-empty mapping, cache it and return.
+      - If it fails or parses to empty, fall back to a recent cached mapping
+        (if available) instead of returning {}.
+    """
+    league_up = (league or "").upper()
+    if league_up not in PRECAP_URLS:
+        raise ValueError(f"Unsupported league for inpredictable PreCap: {league!r}")
+
+    url = PRECAP_URLS[league_up]
+
+    try:
+        html = _fetch_precap_html(url)
+        if html:
+            mapping = _parse_precap_table(html)
+            if mapping:
+                _set_cached_mapping(league_up, mapping)
+                _log(f"parsed {len(mapping)} finished games from PreCap for {league_up}")
+                return mapping
+            else:
+                _log(f"parsed 0 finished games from PreCap for {league_up}")
+        else:
+            _log(f"no HTML from PreCap for {league_up}")
+    except Exception as ex:
+        _log(f"unexpected error in fetch_excitement_map({league_up}): {ex}")
+
+    # Fallback: use cached mapping if available
+    cached = _get_cached_mapping(league_up)
+    if cached:
+        _log(
+            f"using cached Excitement mapping for {league_up} "
+            f"(len={len(cached)})"
         )
+        return cached
 
-    _log(f"{len(games_out)} total {league_key} events on {date_iso}")
-    return games_out
+    # Nothing available
+    _log(f"no Excitement data available (live or cache) for {league_up}")
+    return {}
