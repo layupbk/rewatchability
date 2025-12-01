@@ -35,12 +35,19 @@ LOCAL_TZ = ZoneInfo("America/Los_Angeles")
 
 def _today_iso_local() -> str:
     """
-    Today's date in Los Angeles time as YYYY-MM-DD.
+    Game-day date in Los Angeles time as YYYY-MM-DD.
 
-    This fixes the issue where UTC flips to the next day while it's
-    still the previous evening in LA (e.g., 11/30 10:30pm PT).
+    Rule:
+      - From midnight until 5:59 AM PT, we still consider the "game day"
+        to be *yesterday* (so late-night games and EI backfill are included).
+      - From 6:00 AM PT onward, the game day is *today*.
     """
-    return datetime.datetime.now(LOCAL_TZ).date().isoformat()
+    now = datetime.datetime.now(LOCAL_TZ)
+    if now.hour < 6:
+        game_day = now.date() - datetime.timedelta(days=1)
+    else:
+        game_day = now.date()
+    return game_day.isoformat()
 
 
 def _date_line_from_iso(date_iso: str) -> str:
@@ -63,6 +70,7 @@ def _format_console_block(
     date_line = _date_line_from_iso(date_iso)
     network = (game.get("broadcast") or "").strip() or "Streaming / Local"
 
+    # Full names preferred for display; abbreviations only as backup.
     away = game.get("away") or game.get("away_short") or "Away"
     home = game.get("home") or game.get("home_short") or "Home"
 
@@ -240,7 +248,7 @@ def run() -> None:
     prune_ledger(ledger, days=LEDGER_DAYS)
 
     while True:
-        # 🔑 KEY: use Los Angeles date, not UTC date.
+        # Use "basketball night" based on Los Angeles time.
         date_iso = _today_iso_local()
 
         for sport in SPORTS:

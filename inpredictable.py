@@ -12,6 +12,7 @@
 from __future__ import annotations
 
 import re
+import time
 from typing import Dict, Tuple
 
 import requests
@@ -36,17 +37,44 @@ GAME_CELL_RE = re.compile(
 )
 
 
-def _fetch_precap_html(url: str) -> str | None:
-    try:
-        resp = requests.get(url, timeout=10)
-        if resp.status_code != 200:
-            print(f"[INPRED] GET {url} -> {resp.status_code}", flush=True)
-            return None
-        resp.encoding = "utf-8"
-        return resp.text
-    except Exception as ex:
-        print(f"[INPRED] error fetching {url}: {ex}", flush=True)
-        return None
+def _fetch_precap_html(url: str, attempts: int = 3, timeout: int = 20) -> str | None:
+    """
+    Fetch the raw HTML for a PreCap page, with retries.
+
+    - attempts: how many times to retry on network/timeout errors.
+    - timeout: seconds per individual HTTP request.
+    """
+    last_exc: Exception | None = None
+
+    for attempt in range(1, attempts + 1):
+        try:
+            resp = requests.get(url, timeout=timeout)
+            if resp.status_code != 200:
+                print(
+                    f"[INPRED] GET {url} -> {resp.status_code} on attempt "
+                    f"{attempt}/{attempts}",
+                    flush=True,
+                )
+                last_exc = RuntimeError(f"HTTP {resp.status_code}")
+            else:
+                resp.encoding = "utf-8"
+                return resp.text
+        except Exception as ex:
+            last_exc = ex
+            print(
+                f"[INPRED] error fetching {url} on attempt "
+                f"{attempt}/{attempts}: {ex}",
+                flush=True,
+            )
+
+        if attempt < attempts:
+            time.sleep(3)  # brief pause before trying again
+
+    print(
+        f"[INPRED] giving up after {attempts} attempts for {url}: {last_exc}",
+        flush=True,
+    )
+    return None
 
 
 def _parse_precap_table(html: str) -> Dict[Tuple[str, str], float]:
@@ -56,8 +84,10 @@ def _parse_precap_table(html: str) -> Dict[Tuple[str, str], float]:
     """
     rows: Dict[Tuple[str, str], float] = {}
 
+    # Normalize <br> tags to spaces so the regex can work on the text
     cleaned = re.sub(r"<br\s*/?>", " ", html, flags=re.IGNORECASE)
 
+    # Find the header row that starts the main table
     header_match = re.search(
         r"Rank\s*Game\s*Status\s*Excitement\s*Tension",
         cleaned,
@@ -119,8 +149,12 @@ def fetch_excitement_map(league: str) -> Dict[Tuple[str, str], float]:
     url = PRECAP_URLS[league_up]
     html = _fetch_precap_html(url)
     if not html:
+        # We already logged why it failed; return empty so caller can "WAIT".
         return {}
 
     mapping = _parse_precap_table(html)
-    print(f"[INPRED] parsed {len(mapping)} finished games from PreCap for {league_up}", flush=True)
+    print(
+        f"[INPRED] parsed {len(mapping)} finished games from PreCap for {league_up}",
+        flush=True,
+    )
     return mapping
