@@ -39,17 +39,19 @@ def _fetch_raw_html(url: str) -> str:
 
 def _extract_main_table(html: str) -> str:
     """
-    The PreCap page has a TON of Blogger/JS noise. We only want the chunk
-    between the 'Rank Game Status Excitement...' header and 'League Averages'.
-    This also avoids bogus matches like 'SON @ ONE' in script tags.
+    Try to narrow to the main PreCap table to avoid garbage like 'SON @ ONE'
+    from script tags. If we can't find the header cleanly, fall back to the
+    full HTML so we still parse rows (like the version that was working before).
     """
     header = "Rank Game Status Excitement"
     footer = "League Averages"
 
     start = html.find(header)
     if start == -1:
-        _log("could not locate PreCap table header")
-        return ""
+        # IMPORTANT: don't bail – just log and use full html (this is what
+        # previously gave you good results).
+        _log("could not locate PreCap table header; using full HTML for parsing")
+        return html
 
     end = html.find(footer, start)
     if end == -1:
@@ -60,17 +62,19 @@ def _extract_main_table(html: str) -> str:
 
 def _parse_pre_cap_table(league: str, html: str) -> Dict[Tuple[str, str], float]:
     """
-    Parse the PreCap table and return a mapping:
+    Parse the PreCap page and return a mapping:
         (AWAY_ESPN_ABBR, HOME_ESPN_ABBR) -> excitement (float)
     """
     table = _extract_main_table(html)
     if not table:
         return {}
 
-    _log(f"PreCap text length = {len(html)} chars")
+    _log(f"PreCap text length = {len(table)} chars")
 
-    # Pattern (within the table chunk) looks roughly like:
+    # Pattern within the (table) chunk looks roughly like:
     #   1  ATL @ PHI  ... Finished 13.7  82% ...
+    # We explicitly require 'Finished' right after the matchup to avoid weird
+    # junk like SON @ ONE from script blocks.
     row_pattern = re.compile(
         r"\b\d+\s*([A-Z]{2,3})\s*@\s*([A-Z]{2,3}).*?Finished\s+([\d.]+)",
         re.DOTALL,
