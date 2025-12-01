@@ -1,18 +1,17 @@
-"""
-ESPN scoreboard adapter for Rewatchability (basketball-only).
-
-Public API:
-    get_scoreboard(league_key: str, date_iso: str) -> list[dict]
-
-Returns a list of games shaped like:
-    {
-        "id": str,        # ESPN event id
-        "away": str,      # e.g. "Celtics"
-        "home": str,      # e.g. "Lakers"
-        "is_final": bool, # True if completed/final
-        "broadcast": str, # national network or "" if local/none
-    }
-"""
+# espn_adapter.py
+# ESPN scoreboard adapter for Rewatchability (basketball-only).
+#
+# Public API:
+#   get_scoreboard(league_key: str, date_iso: str) -> list[dict]
+#
+# Returns a list of games shaped like:
+#   {
+#       "id": str,            # ESPN event id
+#       "away": str,          # e.g. "Celtics"
+#       "home": str,          # e.g. "Lakers"
+#       "is_final": bool,     # True if completed/final
+#       "broadcast": str,     # NATIONAL network or "" if local/none
+#   }
 
 from __future__ import annotations
 
@@ -20,6 +19,8 @@ import datetime
 from typing import Any, Dict, List, Optional
 
 import requests
+
+from posting_rules import is_national_broadcast
 
 ESPN_SCOREBOARD_API = (
     "https://site.api.espn.com/apis/site/v2/sports/{sport_group}/{league}/scoreboard"
@@ -73,7 +74,7 @@ def _get_espn_scoreboard(
 
 def _safe_team_name(team_obj: Dict[str, Any]) -> str:
     """
-    Normalize a team name that matches our NAME_TO_INPRED mapping
+    Normalize a team name that matches your NAME_TO_INPRED mapping
     (e.g., 'Hawks', 'Cavaliers', 'Liberty').
     """
     if not team_obj:
@@ -89,28 +90,56 @@ def _safe_team_name(team_obj: Dict[str, Any]) -> str:
     return str(name).strip()
 
 
-def _pick_national_broadcast(comp: Dict[str, Any]) -> str:
+def _pick_national_broadcast(comp: Dict[str, Any], sport: str) -> str:
     """
-    Return a simple network string if the game has a national/international broadcast.
-    Safely handles the case where `names` is a list.
+    Return a network string ONLY if it is a *national* TV / streaming broadcast.
+
+    Uses posting_rules.is_national_broadcast() to enforce your rules.
+    If all broadcasts are local, returns "".
     """
     casts = comp.get("broadcasts") or []
     if not casts:
         return ""
 
-    b = casts[0] or {}
+    sport_up = (sport or "").upper()
 
-    names = b.get("names")
-    short_name = b.get("shortName")
-    long_name = b.get("name")
+    # ESPN may give:
+    #   "names": ["ESPN", "ESPN2"]   (list)
+    #   "names": "ESPN"             (string)
+    #   "shortName": "ESPN"
+    #   "name": "ESPN / ESPN2"
+    #
+    # We walk through *all* broadcasts, and only keep those that look national.
+    for b in casts:
+        if not b:
+            continue
 
-    # `names` can be a list like ["ESPN", "ESPN2"] or a single string.
-    if isinstance(names, list) and names:
-        candidate = names[0]
-    else:
-        candidate = names or short_name or long_name or ""
+        names = b.get("names")
+        short_name = b.get("shortName")
+        long_name = b.get("name")
 
-    return str(candidate).strip()
+        candidates: List[str] = []
+
+        if isinstance(names, list):
+            candidates.extend(str(x) for x in names if x)
+        elif isinstance(names, str):
+            candidates.append(names)
+
+        if short_name:
+            candidates.append(str(short_name))
+        if long_name:
+            candidates.append(str(long_name))
+
+        # Test each candidate against your NATIONAL_KEYWORDS via posting_rules
+        for cand in candidates:
+            cand_clean = str(cand).strip()
+            if not cand_clean:
+                continue
+            if is_national_broadcast(cand_clean, sport_up):
+                return cand_clean  # FIRST national network wins
+
+    # No national network found → treat as local-only
+    return ""
 
 
 def get_scoreboard(league_key: str, date_iso: str) -> List[Dict[str, Any]]:
@@ -123,7 +152,7 @@ def get_scoreboard(league_key: str, date_iso: str) -> List[Dict[str, Any]]:
             "away": str,
             "home": str,
             "is_final": bool,
-            "broadcast": str,
+            "broadcast": str,   # national only; "" if no national
         }
     """
     league_key = (league_key or "").upper()
@@ -176,7 +205,8 @@ def get_scoreboard(league_key: str, date_iso: str) -> List[Dict[str, Any]]:
             elif side == "home":
                 home_name = name
 
-        broadcast = _pick_national_broadcast(comp)
+        # NATIONAL broadcast only (or "")
+        broadcast = _pick_national_broadcast(comp, league_key)
 
         games_out.append(
             {
