@@ -1,10 +1,9 @@
 # main.py — Basketball-only, Inpredictable EI, ESPN scoreboard, clean formatting
-
 import os
 import time
 import datetime
 from zoneinfo import ZoneInfo
-from typing import Dict, Any, List, Tuple, Optional
+from typing import Dict, Any, List
 
 from espn_adapter import get_scoreboard
 from inpredictable import fetch_excitement_map
@@ -14,20 +13,15 @@ from formatting import to_weekday_mm_d_yy
 from posting_rules import should_auto_post
 from ledger import load_ledger, save_ledger, prune_ledger, already_posted, mark_posted
 
-# ----------------------------------------------------------------------
-# Config
-# ----------------------------------------------------------------------
+# --- CONFIG ---------------------------------------------------------------
 
 POLL_SECONDS: int = int(os.getenv("POLL_SECONDS", "60"))
 LEDGER_DAYS: int = int(os.getenv("LEDGER_DAYS", "7"))
-
-# Basketball-only:
 SPORTS: List[str] = ["NBA", "WNBA"]
 
-# Use Los Angeles time (Pacific) for defining the "game day"
 LOCAL_TZ = ZoneInfo("America/Los_Angeles")
 
-# Mapping you provided: ESPN scores-page team name -> Inpredictable code
+# Mapping user provided: ESPN name → Inpredictable 3-letter code
 NAME_TO_INPRED: Dict[str, str] = {
     # NBA
     "Hawks": "ATL",
@@ -77,72 +71,53 @@ NAME_TO_INPRED: Dict[str, str] = {
     "Sun": "CON",
 }
 
-# ----------------------------------------------------------------------
-# Date logic – 8:59 AM PT cutoff
-# ----------------------------------------------------------------------
+
+# --- DATE LOGIC -----------------------------------------------------------
 
 def _today_iso_local() -> str:
     """
-    Game-day date in Los Angeles time as YYYY-MM-DD.
-
-    Rule:
-      - From midnight up to 8:59 AM PT, we still consider the "game day"
-        to be *yesterday* (to catch all late games + EI updates).
+    LA-based game day:
+      - From midnight up to 8:59 AM PT, we still treat the "game day" as *yesterday*.
       - From 9:00 AM PT onward, the game day is *today*.
     """
     now = datetime.datetime.now(LOCAL_TZ)
-    # hour is an int 0–23; if hour < 9, it's before 9:00 AM.
     if now.hour < 9:
-        game_day = now.date() - datetime.timedelta(days=1)
+        day = now.date() - datetime.timedelta(days=1)
     else:
-        game_day = now.date()
-    return game_day.isoformat()
+        day = now.date()
+    return day.isoformat()
 
 
 def _format_date(date_iso: str) -> str:
-    """Format 'YYYY-MM-DD' -> 'Sun · 11/30/25' for console output."""
     try:
         return to_weekday_mm_d_yy(date_iso)
     except Exception:
         return date_iso
 
 
-# ----------------------------------------------------------------------
-# Formatting
-# ----------------------------------------------------------------------
+# --- FORMATTING -----------------------------------------------------------
 
 def _format_block(
     game: Dict[str, Any],
     score_val: int,
-    excite_raw: Optional[float],
+    excite_raw: float | None,
     date_iso: str,
 ) -> str:
-    """
-    Build the console block for a single game.
+    """Print block for Render logs."""
+    away = game["away"]
+    home = game["home"]
 
-    - Uses team nicknames only (e.g. "Celtics", "Knicks").
-    - Shows network only if it's national/international (set in espn_adapter/posting_rules).
-    - Shows Excitement at the bottom for *internal reference only*.
-    """
-    away = game.get("away") or game.get("away_short") or "Away"
-    home = game.get("home") or game.get("home_short") or "Home"
-
-    network = (game.get("broadcast") or "").strip()
-    headline = f"🏀 {away} @ {home}"
-    if network:
-        headline += f" — {network}"
-    headline += " — FINAL"
-
-    vibe = pick_vibe(score_val)
     date_line = _format_date(date_iso)
+    vibe = pick_vibe(score_val)
 
     if excite_raw is None:
         excite_line = "(Excitement unavailable yet)"
     else:
+        # Internal-only reference; never public-facing.
         excite_line = f"(Excitement {excite_raw:.1f})"
 
     lines = [
-        headline,
+        f"🏀 {away} @ {home} — FINAL",
         f"Rewatchability Score™: {score_val}",
         vibe,
         date_line,
@@ -152,170 +127,102 @@ def _format_block(
     return "\n".join(lines)
 
 
-# ----------------------------------------------------------------------
-# League processing
-# ----------------------------------------------------------------------
+# --- MAIN PROCESSING ------------------------------------------------------
 
-def _process_league(
-    sport: str,
-    date_iso: str,
-    ledger: Dict[str, str],
-) -> None:
-    """
-    Process NBA or WNBA for a given date.
+def _process_league(sport: str, date_iso: str, ledger: Dict[str, str]) -> None:
+    print(f"[LOOP] checking {sport} for {date_iso}", flush=True)
 
-    Flow:
-      - Get ESPN scoreboard (no preseason – handled in espn_adapter).
-      - Pull Excitement map from inpredictable (PreCap), *per date* with caching.
-      - For every FINAL game:
-          * Map ESPN team names -> Inpredictable codes
-          * Look up Excitement
-          * Compute score = 40 + 4 * EI (capped in scoring.py)
-          * Apply auto-post rules (national TV or 70+)
-          * Print block for EVERY game (posted or recap)
-      - Fallback: if *no* game is national/70+ and all games are final & have EI,
-        post the single top game.
-      - "Retry until EI appears" happens naturally: each loop re-fetches EI and
-        we only fallback once every final has EI.
-    """
-    sport_up = sport.upper()
-    print(f"[LOOP] checking {sport_up} for {date_iso}", flush=True)
-
-    games = get_scoreboard(sport_up, date_iso)
-    print(f"[ESPN] {len(games)} total {sport_up} events on {date_iso}", flush=True)
-
+    games = get_scoreboard(sport, date_iso)
+    print(f"[ESPN] {len(games)} total {sport} events on {date_iso}", flush=True)
     if not games:
         return
 
-    # Are all games for this date & league final (per ESPN)?
-    all_final_flag = all(g.get("is_final") for g in games)
+    all_final = all(g["is_final"] for g in games)
 
-    # Excitement from Inpredictable PreCap (per league + date, with caching)
-    excite_map = fetch_excitement_map(sport_up, date_iso)
+    # Uses the newer inpredictable.py signature: (league, date_iso)
+    excite_map = fetch_excitement_map(sport, date_iso)
 
-    # Keep all scored outcomes + track finals missing EI
-    scored_rows: List[Tuple[Dict[str, Any], int, Optional[float], bool]] = []
-    finals_missing_ei: List[Dict[str, Any]] = []
+    scored = []
+    finals_missing_ei = []
 
     for g in games:
-        if not g.get("is_final"):
+        if not g["is_final"]:
             continue
 
-        away_name = g.get("away") or ""
-        home_name = g.get("home") or ""
+        away = g["away"]
+        home = g["home"]
 
-        away_code = NAME_TO_INPRED.get(away_name)
-        home_code = NAME_TO_INPRED.get(home_name)
+        away_code = NAME_TO_INPRED.get(away)
+        home_code = NAME_TO_INPRED.get(home)
 
-        excite_raw: Optional[float] = None
+        excite_raw = None
         if away_code and home_code:
             excite_raw = excite_map.get((away_code, home_code))
 
         if excite_raw is None:
             finals_missing_ei.append(g)
             print(
-                f"[WAIT] {sport_up} {g.get('id')} "
-                f"({away_name} @ {home_name}) has no Excitement yet.",
+                f"[WAIT] {sport} {g['id']} ({away} @ {home}) has no Excitement yet.",
                 flush=True,
             )
 
-        # Score: if EI missing, we still compute score from 0 for display,
-        # but we do *not* use that game for fallback until EI is present.
-        raw_for_scoring = excite_raw if excite_raw is not None else 0.0
-        result = score_game(sport_up, raw_for_scoring)
-        score_val = result.score
+        # If EI missing, we still compute a placeholder score from 0 for display,
+        # but this game will not be used for fallback until EI is present.
+        score_val = score_game(sport, excite_raw or 0).score
+        auto_rule = should_auto_post(score_val, g.get("broadcast"), sport)
 
-        network = (g.get("broadcast") or "").strip()
-        auto_rule = should_auto_post(score_val, network, sport_up)
+        block = _format_block(g, score_val, excite_raw, date_iso)
 
-        block = _format_block(
-            game=g,
-            score_val=score_val,
-            excite_raw=excite_raw,
-            date_iso=date_iso,
-        )
-
-        event_id = g["id"]
-
-        if already_posted(ledger, event_id):
+        if already_posted(ledger, g["id"]):
             print("[RECAP ONLY] (already posted this game before)", flush=True)
             print(block, flush=True)
         else:
             if auto_rule:
                 print(block, flush=True)
-                mark_posted(ledger, event_id)
+                mark_posted(ledger, g["id"])
             else:
-                print("[RECAP ONLY] (below threshold / not national)", flush=True)
+                print("[RECAP ONLY]", flush=True)
                 print(block, flush=True)
 
-        scored_rows.append((g, score_val, excite_raw, auto_rule))
+        scored.append((g, score_val, excite_raw, auto_rule))
 
-    # If nothing was final / scored, we're done.
-    if not scored_rows:
-        if finals_missing_ei:
-            print(
-                f"[INFO] {sport_up} {date_iso}: finals missing Excitement; "
-                "waiting for PreCap.",
-                flush=True,
-            )
+    # --- Fallback logic ---------------------------------------------------
+
+    # If any game met auto-post rules (national TV or 70+), no fallback.
+    if any(a for (_, _, _, a) in scored):
         return
 
-    # If any game already met auto-post rules (national or 70+),
-    # we don't need fallback.
-    if any(auto for (_, _, _, auto) in scored_rows):
-        return
-
-    # If not all games are final, don't fallback yet.
-    if not all_final_flag:
+    # If not all games are final yet, do nothing.
+    if not all_final:
         print(
-            f"[FALLBACK] {sport_up} {date_iso}: no 70+ or national TV yet, "
+            f"[FALLBACK] {sport} {date_iso}: no 70+ or national TV yet, "
             "but not all games are final. Waiting.",
             flush=True,
         )
         return
 
-    # If some finals are still missing EI, don't fallback yet.
+    # If some finals still don’t have EI, don’t fallback yet.
     if finals_missing_ei:
         print(
-            f"[FALLBACK] {sport_up} {date_iso}: all games final, "
+            f"[FALLBACK] {sport} {date_iso}: all games final, "
             "but some have no EI yet. Waiting.",
             flush=True,
         )
         return
 
-    # Fallback: all finals, all EI present, none 70+/national.
-    # Choose highest score.
+    # Safe fallback: highest score among all fully-EI games.
     best_game, best_score, best_raw, _ = max(
-        scored_rows,
-        key=lambda tup: tup[1],
+        scored,
+        key=lambda t: t[1],
     )
 
-    best_id = best_game["id"]
-    if already_posted(ledger, best_id):
-        print(
-            f"[FALLBACK] {sport_up} {date_iso}: top game {best_id} "
-            "already posted.",
-            flush=True,
-        )
-        return
-
-    print(
-        f"[FALLBACK] {sport_up} {date_iso}: posting top game {best_id}.",
-        flush=True,
-    )
-    fb_block = _format_block(
-        game=best_game,
-        score_val=best_score,
-        excite_raw=best_raw,
-        date_iso=date_iso,
-    )
-    print(fb_block, flush=True)
-    mark_posted(ledger, best_id)
+    if not already_posted(ledger, best_game["id"]):
+        print(f"[FALLBACK] {sport} posting top game {best_game['id']}", flush=True)
+        print(_format_block(best_game, best_score, best_raw, date_iso), flush=True)
+        mark_posted(ledger, best_game["id"])
 
 
-# ----------------------------------------------------------------------
-# Main loop
-# ----------------------------------------------------------------------
+# --- MAIN LOOP ------------------------------------------------------------
 
 def run() -> None:
     print("[RUN] starting Rewatchability autopilot (basketball only)", flush=True)
@@ -329,7 +236,7 @@ def run() -> None:
             try:
                 _process_league(sport, date_iso, ledger)
             except Exception as ex:
-                print(f"[ERROR] exception while processing {sport}: {ex}", flush=True)
+                print(f"[ERROR] {sport}: {ex}", flush=True)
 
         save_ledger(ledger)
         time.sleep(POLL_SECONDS)
