@@ -2,6 +2,7 @@
 import os
 import time
 import datetime
+from zoneinfo import ZoneInfo
 from typing import Dict, Any, List, Tuple
 
 from espn_adapter import get_scoreboard
@@ -28,14 +29,22 @@ LEDGER_DAYS: int = int(os.getenv("LEDGER_DAYS", "7"))
 # Basketball-only:
 SPORTS: List[str] = ["NBA", "WNBA"]
 
+# Use Los Angeles time (Pacific) for defining the "game day"
+LOCAL_TZ = ZoneInfo("America/Los_Angeles")
 
-def _utc_today_iso() -> str:
-    """Today's date in UTC as YYYY-MM-DD."""
-    return datetime.datetime.utcnow().date().isoformat()
+
+def _today_iso_local() -> str:
+    """
+    Today's date in Los Angeles time as YYYY-MM-DD.
+
+    This fixes the issue where UTC flips to the next day while it's
+    still the previous evening in LA (e.g., 11/30 10:30pm PT).
+    """
+    return datetime.datetime.now(LOCAL_TZ).date().isoformat()
 
 
 def _date_line_from_iso(date_iso: str) -> str:
-    """Format 'YYYY-MM-DD' -> 'Wed · 11/26/25'."""
+    """Format 'YYYY-MM-DD' -> 'Wed · 11/26/25' for console output."""
     try:
         return to_weekday_mm_d_yy(date_iso)
     except Exception:
@@ -54,8 +63,8 @@ def _format_console_block(
     date_line = _date_line_from_iso(date_iso)
     network = (game.get("broadcast") or "").strip() or "Streaming / Local"
 
-    away = game.get("away_short") or game.get("away") or "Away"
-    home = game.get("home_short") or game.get("home") or "Home"
+    away = game.get("away") or game.get("away_short") or "Away"
+    home = game.get("home") or game.get("home_short") or "Home"
 
     lines = [
         f"🏀 {away} @ {home} — {network} — FINAL",
@@ -77,8 +86,8 @@ def _process_league_for_date(
     Process one league (NBA or WNBA) for a given date.
 
     Logic:
-      - Get full scoreboard from ESPN (no preseason).
-      - Get Excitement map from inpredictable.
+      - Get full scoreboard from ESPN (no preseason – handled in espn_adapter).
+      - Get Excitement map from inpredictable (PreCap pages).
       - Score every FINAL game that has Excitement.
       - Auto-post if national TV or score >= 70.
       - If (all games final) AND (every final game has Excitement) AND (no auto-posts),
@@ -231,7 +240,8 @@ def run() -> None:
     prune_ledger(ledger, days=LEDGER_DAYS)
 
     while True:
-        date_iso = _utc_today_iso()
+        # 🔑 KEY: use Los Angeles date, not UTC date.
+        date_iso = _today_iso_local()
 
         for sport in SPORTS:
             try:
