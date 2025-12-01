@@ -207,9 +207,15 @@ def _process_league(
     scored_rows: List[Tuple[Dict[str, Any], int, Optional[float], bool]] = []
     finals_missing_ei: List[Dict[str, Any]] = []
 
+    # Counters for summary line
+    finals_count = 0
+    ei_found_count = 0
+
     for g in games:
         if not g.get("is_final"):
             continue
+
+        finals_count += 1
 
         away_name = g.get("away") or ""
         home_name = g.get("home") or ""
@@ -228,6 +234,8 @@ def _process_league(
                 f"({away_name} @ {home_name}) has no Excitement yet.",
                 flush=True,
             )
+        else:
+            ei_found_count += 1
 
         # Score: if EI is missing, we still compute from 0 for display,
         # but we will NOT use those games in fallback until EI is present.
@@ -248,7 +256,7 @@ def _process_league(
         event_id = g["id"]
 
         if already_posted(ledger, event_id):
-            print("[RECAP ONLY] (already posted this game before)", flush=True)
+            # Already auto-posted earlier; just print the block as a recap
             print(block, flush=True)
         else:
             if auto_rule:
@@ -259,6 +267,15 @@ def _process_league(
                 print(block, flush=True)
 
         scored_rows.append((g, score_val, excite_raw, auto_rule))
+
+    # Per-league summary line for visibility into EI coverage
+    if finals_count > 0:
+        print(
+            f"[SUMMARY] {sport_up} {date_iso}: "
+            f"{finals_count} finals, {ei_found_count} with EI, "
+            f"{len(finals_missing_ei)} missing EI.",
+            flush=True,
+        )
 
     # If nothing was final / scored, we're done.
     if not scored_rows:
