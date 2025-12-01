@@ -3,14 +3,14 @@ import os
 import time
 import datetime
 from zoneinfo import ZoneInfo
-from typing import Dict, Any, List, Tuple, Optional
+from typing import Dict, Any, List, Tuple
 
 from espn_adapter import get_scoreboard
 from inpredictable import fetch_excitement_map
 from scoring import score_game
 from vibe_tags import pick_vibe
 from formatting import to_weekday_mm_d_yy
-from posting_rules import should_auto_post, is_national_broadcast
+from posting_rules import should_auto_post
 from ledger import (
     load_ledger,
     save_ledger,
@@ -61,44 +61,41 @@ def _date_line_from_iso(date_iso: str) -> str:
 def _format_console_block(
     game: Dict[str, Any],
     sport: str,
-    score_val: Optional[int],
-    excite_raw: Optional[float],
+    score_val: int,
+    excite_raw: float,
     date_iso: str,
 ) -> str:
-    """Build the console text we print for a single game.
-
-    This is *console-only* / internal. The Excitement value here will never be
-    posted publicly – it's purely for debugging and internal reference.
     """
+    Build the console text we print for a single game.
+
+    - Uses team *nicknames* only (e.g. "Celtics", "Cavaliers").
+    - Only shows a network if it's a national/international broadcast.
+    - Excitement is shown for internal reference only.
+    """
+    vibe = pick_vibe(score_val)
     date_line = _date_line_from_iso(date_iso)
 
-    # Only show network if it's a national TV/streaming broadcast.
-    network_raw = (game.get("broadcast") or "").strip()
-    is_national = is_national_broadcast(network_raw, sport)
+    # Full names preferred for display; abbreviations only as backup.
+    # 'away'/'home' are already nicknames from espn_adapter.
+    away = (game.get("away") or game.get("away_short") or "Away").strip()
+    home = (game.get("home") or game.get("home_short") or "Home").strip()
 
-    away = game.get("away") or game.get("away_short") or "Away"
-    home = game.get("home") or game.get("home_short") or "Home"
+    network = (game.get("broadcast") or "").strip()
 
-    if is_national and network_raw:
-        header = f"🏀 {away} @ {home} — {network_raw} — FINAL"
-    else:
-        header = f"🏀 {away} @ {home} — FINAL"
+    # Headline: only include network segment if present.
+    headline = f"🏀 {away} @ {home}"
+    if network:
+        headline += f" — {network}"
+    headline += " — FINAL"
 
-    lines: List[str] = [header]
-
-    if score_val is not None:
-        lines.append(f"Rewatchability Score™: {score_val}")
-        vibe = pick_vibe(score_val)
-        if vibe:
-            lines.append(vibe)
-
-    lines.append(date_line)
-
-    # Excitement is internal-only; safe to log here, never posted publicly.
-    if excite_raw is not None:
-        lines.append(f"(Excitement {excite_raw:.1f})")
-
-    lines.append("-" * 40)
+    lines = [
+        headline,
+        f"Rewatchability Score™: {score_val}",
+        vibe,
+        date_line,
+        f"(Excitement {excite_raw:.1f})",  # internal only
+        "-" * 40,
+    ]
     return "\n".join(lines)
 
 
@@ -111,14 +108,12 @@ def _process_league_for_date(
     Process one league (NBA or WNBA) for a given date.
 
     Logic:
-      1. Pull ESPN scoreboard for the date.
-      2. Pull inpredictable Excitement for all games.
-      3. For each final game:
-         - If we have Excitement: score, decide if it should auto-post.
-         - If missing Excitement: log a WAIT and still show a recap with no score.
-      4. Apply auto-post rules (national TV or score >= threshold).
-      5. If no auto-post and all games are final and have Excitement, pick a
-         single highest-scoring game as a fallback feature.
+      - Get full scoreboard from ESPN (no preseason – handled in espn_adapter).
+      - Get Excitement map from inpredictable (PreCap pages).
+      - Score every FINAL game that has Excitement.
+      - Auto-post if national TV or score >= 70.
+      - If (all games final) AND (every final game has Excitement) AND (no auto-posts),
+        then post the single highest-scoring game as a fallback.
     """
     sport_up = sport.upper()
     print(f"[LOOP] checking {sport_up} for {date_iso}", flush=True)
@@ -147,7 +142,7 @@ def _process_league_for_date(
 
         away_short = g.get("away_short") or g.get("away") or ""
         home_short = g.get("home_short") or g.get("home") or ""
-        key: Tuple[str, str] = (away_short, home_short)
+        key = (away_short, home_short)
 
         excite_raw = excite_map.get(key)
         if excite_raw is None:
@@ -157,19 +152,9 @@ def _process_league_for_date(
                 f"on ESPN but has no Excitement on PreCap yet.",
                 flush=True,
             )
-            # Still show a recap line for this game, just without score/excitement.
-            text_block = _format_console_block(
-                game=g,
-                sport=sport_up,
-                score_val=None,
-                excite_raw=None,
-                date_iso=date_iso,
-            )
-            print("[RECAP ONLY] (no Excitement yet)", flush=True)
-            print(text_block, flush=True)
             continue
 
-        # Score is derived via sport-specific scoring (clamped 40–100).
+        # Score = 40 + 4 * Excitement (no scaling, capped at 99).
         result = score_game(sport_up, excite_raw)
         score_val = result.score
 
@@ -272,9 +257,9 @@ def _process_league_for_date(
 
 
 def run() -> None:
-    """Main poll loop."""
+    print("[RUN] starting Rewatchability autopilot (basketball only)", flush=True)
     ledger = load_ledger()
-    prune_ledger(ledger, LEDGER_DAYS)
+    prune_ledger(ledger, days=LEDGER_DAYS)
 
     while True:
         # Use "basketball night" based on Los Angeles time.

@@ -1,222 +1,201 @@
 # espn_adapter.py
-# ESPN scoreboard adapter for Rewatchability bot (basketball-only).
 #
-# Public API:
-#   get_scoreboard(league_key: str, date_iso: str) -> list[dict]
-#   get_final_like_events(...) -> convenience wrapper
+# ESPN scoreboard adapter for basketball-only (NBA + WNBA).
+# Returns a simplified list of game dicts per date:
 #
-# We only support:
-#   - NBA
-#   - WNBA
-#
-# We also EXCLUDE preseason games explicitly. We only keep:
-#   - Regular season
-#   - Playoffs / Play-In (non-preseason)
+#   {
+#       "id": "401810163",
+#       "sport": "NBA",
+#       "date": "2025-11-30",
+#       "is_final": True/False,
+#       # display names (nicknames only, e.g. "Celtics")
+#       "away": "Celtics",
+#       "home": "Cavaliers",
+#       # abbreviations used for Inpredictable PreCap (e.g. "BOS", "CLE")
+#       "away_short": "BOS",
+#       "home_short": "CLE",
+#       # full names like "Boston Celtics" if you ever need them
+#       "away_full": "Boston Celtics",
+#       "home_full": "Cleveland Cavaliers",
+#       # national TV/streaming only ("" if local/unknown)
+#       "broadcast": "ESPN"  # or "", "TNT", "ESPN, ABC", etc.
+#   }
 
 from __future__ import annotations
 
-import os
-from typing import Any, Dict, Final, List, Tuple
-
+from typing import Any, Dict, List
+import datetime
 import requests
 
-DEBUG: bool = os.getenv("DEBUG_ESPN", "1").lower() not in ("0", "false", "no")
-TIMEOUT: float = float(os.getenv("ESPN_TIMEOUT", "8.0"))
+# ----------------------------------------------------------------------
+# League → ESPN path
+# ----------------------------------------------------------------------
 
-USER_AGENT: str = os.getenv(
-    "ESPN_UA",
-    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
-    "AppleWebKit/537.36 (KHTML, like Gecko) "
-    "Chrome/130.0 Safari/537.36",
-)
-
-HEADERS: Final[dict[str, str]] = {
-    "User-Agent": USER_AGENT,
-    "Accept": "application/json, text/plain, */*",
-    "Accept-Language": "en-US,en;q=0.9",
-    "Connection": "keep-alive",
-}
-
-# Only NBA + WNBA
-LEAGUE_PATH: Final[dict[str, Tuple[str, str]]] = {
-    "NBA": ("basketball", "nba"),
-    "WNBA": ("basketball", "wnba"),
+_LEAGUE_PATHS: Dict[str, str] = {
+    "NBA": "basketball/nba",
+    "WNBA": "basketball/wnba",
 }
 
 
-def _log(msg: str) -> None:
-    if DEBUG:
-        print(f"[ESPN] {msg}", flush=True)
+def _scoreboard_url(league: str) -> str:
+    league_up = league.upper()
+    if league_up not in _LEAGUE_PATHS:
+        raise ValueError(f"Unsupported league for ESPN scoreboard: {league!r}")
+    return f"https://site.api.espn.com/apis/site/v2/sports/{_LEAGUE_PATHS[league_up]}/scoreboard"
 
 
-def _scoreboard_urls(league_key: str) -> List[str]:
-    sport, league = LEAGUE_PATH[league_key]
-    return [
-        f"https://site.api.espn.com/apis/site/v2/sports/{sport}/{league}/scoreboard",
-        f"https://site.web.api.espn.com/apis/site/v2/sports/{sport}/{league}/scoreboard",
-    ]
-
-
-def _get_json(url: str, params: dict[str, str]) -> Dict[str, Any] | None:
-    try:
-        _log(f"[DEBUG] GET {url} params={params}")
-        resp = requests.get(url, params=params, headers=HEADERS, timeout=TIMEOUT)
-        if resp.status_code != 200:
-            _log(f"[DEBUG] non-200 from {url}: {resp.status_code}")
-            return None
-        return resp.json()
-    except Exception as ex:
-        _log(f"[DEBUG] request error for {url}: {ex}")
-        return None
-
-
-def _is_final(comp: Dict[str, Any]) -> bool:
-    status = (comp.get("status") or {}).get("type") or {}
-    state = (status.get("state") or "").lower()
-    completed = bool(status.get("completed"))
-    return completed and state == "post"
-
-
-def _is_in_season(comp: Dict[str, Any]) -> bool:
+def _fetch_scoreboard(league: str, date_iso: str) -> Dict[str, Any]:
     """
-    Filter out preseason games.
-
-    ESPN season types are usually:
-      1 = preseason
-      2 = regular season
-      3 = postseason
-      4 = play-in
-    We only keep 2/3/4.
+    Fetch scoreboard JSON for the given league and date (YYYY-MM-DD).
     """
-    season = comp.get("season") or {}
-    try:
-        season_type = int(season.get("type", 0))
-    except (TypeError, ValueError):
-        return True  # be permissive if missing
-    return season_type in (2, 3, 4)
-
-
-def _split_home_away(comp: Dict[str, Any]) -> Tuple[Dict[str, Any] | None, Dict[str, Any] | None]:
-    home = None
-    away = None
-    for c in comp.get("competitors") or []:
-        side = (c.get("homeAway") or "").lower()
-        if side == "home":
-            home = c
-        elif side == "away":
-            away = c
-    return home, away
-
-
-def _team_fields(team_wrapper: Dict[str, Any]) -> Tuple[str, str]:
-    team = team_wrapper.get("team") or {}
-    # Prefer ESPN's shortDisplayName (e.g., "Celtics") for UI-facing team names.
-    name = (
-        team.get("shortDisplayName")
-        or team.get("displayName")
-        or team.get("name")
-        or "Team"
-    )
-    # Abbreviation is used for matching against inpredictable / PreCap.
-    abbr = team.get("abbreviation") or name
-    return name, abbr
-
-
-def _extract_broadcast(comp: Dict[str, Any]) -> str:
-    """Return the primary broadcast string, or "" if there isn't one.
-
-    ESPN sometimes uses "broadcasts", sometimes "geoBroadcasts". We no longer
-    return a placeholder like "Streaming / Local" because the caller only needs
-    this field when there's an actual named TV/streaming network.
-    """
-    broadcasts = comp.get("broadcasts") or comp.get("geoBroadcasts") or []
-    if not broadcasts:
-        return ""
-
-    b = broadcasts[0] or {}
-    return (
-        b.get("shortName")
-        or b.get("name")
-        or b.get("longName")
-        or ""
-    )
-
-
-def get_scoreboard(league_key: str, date_iso: str) -> List[Dict[str, Any]]:
-    """
-    Return a normalized scoreboard for a given league/date.
-
-    league_key: "NBA" or "WNBA"
-    date_iso: "YYYY-MM-DD" in local game-day time
-    """
-    if league_key not in LEAGUE_PATH:
-        raise ValueError(f"Unsupported league_key: {league_key!r}")
-
-    # ESPN expects dates as YYYYMMDD
+    url = _scoreboard_url(league)
     dates_param = date_iso.replace("-", "")
 
-    last_err = None
-    data: Dict[str, Any] | None = None
+    params = {"dates": dates_param}
+    print(f"[ESPN] [DEBUG] GET {url} params={params}", flush=True)
 
-    for url in _scoreboard_urls(league_key):
-        data = _get_json(url, {"dates": dates_param})
-        if data is not None:
-            _log(
-                f"[INFO] scoreboard OK for {league_key} on {date_iso} via "
-                f"{url} dates={dates_param}"
-            )
-            break
+    resp = requests.get(url, params=params, timeout=10)
+    if resp.status_code != 200:
+        print(f"[ESPN] [WARN] scoreboard HTTP {resp.status_code} for {league} on {date_iso}", flush=True)
+        resp.raise_for_status()
 
-    if data is None:
-        raise RuntimeError(
-            f"Could not fetch ESPN scoreboard for {league_key} {date_iso}; "
-            f"last_err={last_err}"
-        )
+    data = resp.json()
+    print(
+        f"[ESPN] [INFO] scoreboard OK for {league} on {date_iso} via {url} dates={dates_param}",
+        flush=True,
+    )
+    return data
+
+
+def _is_final(competition: Dict[str, Any]) -> bool:
+    status = competition.get("status", {}).get("type", {})
+    state = (status.get("state") or "").lower()
+    completed = bool(status.get("completed"))
+    return completed or state in ("post", "final", "status_final")
+
+
+def _is_preseason(event: Dict[str, Any]) -> bool:
+    """
+    Filter out preseason games.
+    ESPN season types are typically:
+      1 = preseason, 2 = regular season, 3+ = playoffs/play-in.
+    """
+    season_type = event.get("season", {}).get("type")
+    return season_type == 1
+
+
+def _extract_team_fields(team_comp: Dict[str, Any]) -> Dict[str, str]:
+    """
+    Extract abbreviation + nickname + full display name for one team.
+    """
+    t = team_comp.get("team") or {}
+
+    abbrev = (t.get("abbreviation") or "").upper().strip()
+    # ESPN usually:
+    #   "abbreviation": "BOS"
+    #   "name": "Celtics"
+    #   "shortDisplayName": "Celtics"
+    #   "displayName": "Boston Celtics"
+    nickname = (t.get("name") or t.get("shortDisplayName") or "").strip()
+    full_name = (t.get("displayName") or f"{nickname}").strip()
+
+    return {
+        "abbrev": abbrev,
+        "nickname": nickname,
+        "full": full_name,
+    }
+
+
+def _extract_broadcast(competition: Dict[str, Any]) -> str:
+    """
+    Build a single broadcast string with ONLY national / international networks.
+    Returns "" for local-only or unknown coverage.
+    """
+    broadcasts = competition.get("broadcasts") or []
+    national_names: List[str] = []
+
+    for b in broadcasts:
+        market = (b.get("market") or "").lower()
+        names = b.get("names") or []
+
+        # Treat "national" & "international" as "national coverage" for our purposes.
+        if market in ("national", "international"):
+            for n in names:
+                n = (n or "").strip()
+                if n and n not in national_names:
+                    national_names.append(n)
+
+    if not national_names:
+        return ""
+
+    return ", ".join(national_names)
+
+
+def get_scoreboard(league: str, date_iso: str) -> List[Dict[str, Any]]:
+    """
+    Public API: fetch every non-preseason event for the given basketball league & date.
+
+    Returns a list of standardized game dicts (see module docstring).
+    """
+    league_up = league.upper()
+    data = _fetch_scoreboard(league_up, date_iso)
 
     events = data.get("events") or []
-    out: List[Dict[str, Any]] = []
+    print(f"[ESPN] {len(events)} total {league_up} events on {date_iso}", flush=True)
 
-    for ev in events:
-        competitions = ev.get("competitions") or []
+    results: List[Dict[str, Any]] = []
+
+    for event in events:
+        if _is_preseason(event):
+            # Skip preseason
+            continue
+
+        competitions = event.get("competitions") or []
         if not competitions:
             continue
         comp = competitions[0]
 
-        if not _is_in_season(comp):
-            # Skip preseason games
+        competitors = comp.get("competitors") or []
+        if len(competitors) < 2:
             continue
 
-        home, away = _split_home_away(comp)
-        if not home or not away:
+        # identify home/away
+        away_comp = None
+        home_comp = None
+        for c in competitors:
+            ha = c.get("homeAway")
+            if ha == "away":
+                away_comp = c
+            elif ha == "home":
+                home_comp = c
+
+        if not away_comp or not home_comp:
             continue
 
-        home_name, home_abbr = _team_fields(home)
-        away_name, away_abbr = _team_fields(away)
+        away_fields = _extract_team_fields(away_comp)
+        home_fields = _extract_team_fields(home_comp)
 
         broadcast = _extract_broadcast(comp)
+        is_final = _is_final(comp)
 
-        event_id = ev.get("id") or comp.get("id")
-        if not event_id:
-            continue
+        game: Dict[str, Any] = {
+            "id": event.get("id"),
+            "sport": league_up,
+            "date": date_iso,
+            "is_final": is_final,
+            # nicknames only, for display (e.g. "Celtics")
+            "away": away_fields["nickname"],
+            "home": home_fields["nickname"],
+            # full names just in case (e.g. "Boston Celtics")
+            "away_full": away_fields["full"],
+            "home_full": home_fields["full"],
+            # abbreviations used to match Inpredictable PreCap keys
+            "away_short": away_fields["abbrev"],
+            "home_short": home_fields["abbrev"],
+            # national/international coverage only; "" if local/unknown
+            "broadcast": broadcast,
+        }
 
-        out.append(
-            {
-                "id": str(event_id),
-                "home": home_name,
-                "home_short": home_abbr,
-                "away": away_name,
-                "away_short": away_abbr,
-                "broadcast": broadcast,
-                "is_final": _is_final(comp),
-            }
-        )
+        results.append(game)
 
-    return out
-
-
-def get_final_like_events(league_key: str, date_iso: str) -> List[Dict[str, Any]]:
-    """
-    Backwards-compatible helper:
-    just filters get_scoreboard(...) down to final games.
-    """
-    return [g for g in get_scoreboard(league_key, date_iso) if g.get("is_final")]
+    return results
