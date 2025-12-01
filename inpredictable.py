@@ -51,50 +51,62 @@ def _fetch_precap_html(url: str) -> Optional[str]:
     return resp.text
 
 
+def _html_to_text(html: str) -> str:
+    """
+    Very simple HTML → text converter:
+    - Turn <br> into newlines
+    - Drop all tags
+    - Normalize non-breaking spaces
+    """
+    # 1) <br> -> newline so each row can live on its own line
+    text = re.sub(r"<br\s*/?>", "\n", html, flags=re.IGNORECASE)
+
+    # 2) Strip any remaining HTML tags
+    text = re.sub(r"<[^>]+>", " ", text)
+
+    # 3) Normalize non-breaking spaces, collapse extra spaces
+    text = text.replace("\xa0", " ")
+    text = re.sub(r"[ \t]+", " ", text)
+
+    return text
+
+
 def _parse_precap_table(html: str) -> Dict[Tuple[str, str], float]:
     """
     Return {(away_abbr, home_abbr): excitement_float} for games
     where Status == "Finished".
 
-    Designed to match lines like:
+    We do NOT rely on specific HTML structure; we just work from
+    the plain text after tags are removed, matching lines like:
 
         1  Finished 13.7 82%38.1+65.0%
         2  Finished 8.2 89%1.7+18.7%
         ...
 
-    on the PreCap page.
+    anywhere in the text.
     """
     rows: Dict[Tuple[str, str], float] = {}
 
     if not html:
         return rows
 
-    # Turn <br> tags into real newlines so each row is easier to match.
-    cleaned = re.sub(r"<br\s*/?>", "\n", html, flags=re.IGNORECASE)
+    text = _html_to_text(html)
 
-    # Find the header row that introduces the rankings table.
-    header_match = re.search(
-        r"Rank\s*Game\s*Status\s*Excitement\s*Tension",
-        cleaned,
-        flags=re.IGNORECASE,
-    )
-    if not header_match:
-        _log("could not find PreCap header row")
-        return rows
-
-    # Only parse text after the header.
-    table_text = cleaned[header_match.end() :]
-
-    # Each row looks roughly like:
+    # Each row in text roughly:
     #   1  Finished 13.7 82%38.1+65.0%
     #
-    # We allow arbitrary junk (links, IDs, 'Image', etc.) between
-    # the rank, the "ATL @ PHI" part, and the "Finished 13.7".
+    # Pattern:
+    #   rank (digits) at start of line
+    #   ...some junk...
+    #   AWAY @ HOME  (both 2–4 capital letters)
+    #   ...some junk...
+    #   Finished / In Progress / Scheduled
+    #   excitement (float)
     line_pattern = re.compile(
         r"""
         ^\s*
-        (?P<rank>\d+)                 # numeric rank at start of line
-        [^\n]*?                       # anything (links, ids, etc.)
+        (?P<rank>\d+)                     # numeric rank at start of line
+        [^\n]*?
         (?P<away>[A-Z]{2,4})\s*@\s*(?P<home>[A-Z]{2,4})  # e.g. ATL @ PHI
         [^\n]*?
         (?P<status>Finished|In\ Progress|Scheduled)
@@ -106,7 +118,7 @@ def _parse_precap_table(html: str) -> Dict[Tuple[str, str], float]:
 
     count_finished = 0
 
-    for m in line_pattern.finditer(table_text):
+    for m in line_pattern.finditer(text):
         status = m.group("status").strip().lower()
         if status != "finished":
             continue
