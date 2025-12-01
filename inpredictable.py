@@ -79,8 +79,8 @@ def _parse_precap_table(html: str) -> Dict[Tuple[str, str], float]:
     We do NOT rely on any "Rank Game Status Excitement" header anymore.
     We just work from the plain text after tags are removed, matching rows like:
 
-        1  Finished 13.7 82%38.1+65.0%
-        2  Finished 8.2 89%1.7+18.7%
+        1ATL @ PHIImage  Finished 13.7 82%38.1+65.0%
+        2OKC @ PORImage  Finished 8.2 89%1.7+18.7%
 
     anywhere in the text.
     """
@@ -93,12 +93,12 @@ def _parse_precap_table(html: str) -> Dict[Tuple[str, str], float]:
     _log(f"PreCap text length = {len(text)} chars")
 
     # Each row in text roughly:
-    #   1  Finished 13.7 82%38.1+65.0%
+    #   1ATL @ PHIImage  Finished 13.7 82%38.1+65.0%
     #
     # Pattern:
     #   rank (digits) at start of line
     #   ...some junk...
-    #   AWAY @ HOME  (both 2–4 capital letters)
+    #   AWAY @ HOME      (both exactly 3 capital letters, e.g. ATL @ PHI)
     #   ...some junk...
     #   Finished / In Progress / Scheduled
     #   excitement (float)
@@ -107,7 +107,7 @@ def _parse_precap_table(html: str) -> Dict[Tuple[str, str], float]:
         ^\s*
         (?P<rank>\d+)                     # numeric rank at start of line
         [^\n]*?
-        (?P<away>[A-Z]{2,4})\s*@\s*(?P<home>[A-Z]{2,4})  # e.g. ATL @ PHI
+        (?P<away>[A-Z]{3})\s*@\s*(?P<home>[A-Z]{3})  # e.g. ATL @ PHI
         [^\n]*?
         (?P<status>Finished|In\ Progress|Scheduled)
         \s+
