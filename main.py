@@ -76,9 +76,8 @@ NAME_TO_INPRED: Dict[str, str] = {
     "Sun": "CON",
 }
 
-
 # ----------------------------------------------------------------------
-# Date logic – RESTORED to 8:59 AM PT cutoff
+# Date logic – 8:59 AM PT cutoff
 # ----------------------------------------------------------------------
 
 def _today_iso_local() -> str:
@@ -155,7 +154,6 @@ def _process_league(
     date_iso: str,
     ledger: Dict[str, str],
 ) -> None:
-
     sport_up = sport.upper()
     print(f"[LOOP] checking {sport_up} for {date_iso}", flush=True)
 
@@ -167,17 +165,17 @@ def _process_league(
 
     all_final_flag = all(g.get("is_final") for g in games)
 
+    # Fetch EI map from Inpredictable, bound to THIS game-day date.
     try:
-        excite_map = fetch_excitement_map(sport_up)
+        excite_map = fetch_excitement_map(sport_up, expected_date_iso=date_iso)
     except Exception as ex:
         print(f"[INPRED ERROR] {sport_up} {date_iso}: {ex}", flush=True)
         excite_map = {}
 
-    scored_rows: List[Tuple[Dict[str, Any], int, Optional[float], bool]] = []
-    finals_missing_ei: List[Dict[str, Any]] = []
-
     finals_count = 0
     ei_found_count = 0
+    finals_missing_ei: List[Dict[str, Any]] = []
+    scored_rows: List[Tuple[Dict[str, Any], int, Optional[float], bool]] = []
 
     for g in games:
         if not g.get("is_final"):
@@ -191,7 +189,7 @@ def _process_league(
         away_code = NAME_TO_INPRED.get(away_name)
         home_code = NAME_TO_INPRED.get(home_name)
 
-        excite_raw = None
+        excite_raw: Optional[float] = None
         if away_code and home_code:
             excite_raw = excite_map.get((away_code, home_code))
 
@@ -210,19 +208,21 @@ def _process_league(
         score_val = result.score
 
         network = (g.get("broadcast") or "")
-        auto_rule = should_auto_post(score_val, network, sport_up)
+        # Only auto-post if EI is present (trusted).
+        auto_rule = bool(excite_raw is not None and should_auto_post(score_val, network, sport_up))
 
         block = _format_block(g, score_val, excite_raw, date_iso)
         event_id = g["id"]
 
         if already_posted(ledger, event_id):
+            # Just show the block again as a recap
             print(block, flush=True)
         else:
             if auto_rule:
                 print(block, flush=True)
                 mark_posted(ledger, event_id)
             else:
-                print("[RECAP ONLY] (below threshold / not national)", flush=True)
+                print("[RECAP ONLY] (below threshold / not national / EI pending)", flush=True)
                 print(block, flush=True)
 
         scored_rows.append((g, score_val, excite_raw, auto_rule))
@@ -231,36 +231,69 @@ def _process_league(
     if finals_count > 0:
         print(
             f"[SUMMARY] {sport_up} {date_iso}: "
-            f"{finals_count} finals, {ei_found_count} with EI, {len(finals_missing_ei)} missing EI.",
+            f"{finals_count} finals, {ei_found_count} with EI, "
+            f"{len(finals_missing_ei)} missing EI.",
             flush=True,
         )
 
-    # No finals printed
+    # No finals that reached this point
     if not scored_rows:
         return
 
+    # If any game already auto-posted, no fallback needed
     if any(auto for (_, _, _, auto) in scored_rows):
         return
 
+    # If not all games are final yet, don't fallback
     if not all_final_flag:
-        print(f"[FALLBACK] {sport_up} {date_iso}: waiting on finals.", flush=True)
-        return
-
-    if finals_missing_ei:
-        print(f"[FALLBACK] {sport_up} {date_iso}: waiting on EI.", flush=True)
-        return
-
-    # Fallback: pick highest score
-    best_game, best_score, best_raw, _ = max(scored_rows, key=lambda t: t[1])
-    best_id = best_game.get("id")
-
-    if best_id and not already_posted(ledger, best_id):
-        print(f"[FALLBACK] {sport_up} {date_iso}: posting top game {best_id}.", flush=True)
         print(
-            _format_block(best_game, best_score, best_raw, date_iso),
+            f"[FALLBACK] {sport_up} {date_iso}: no 70+ or national yet, "
+            "but not all games are final. Waiting.",
             flush=True,
         )
-        mark_posted(ledger, best_id)
+        return
+
+    # If some finals are still missing EI, don't fallback yet
+    if finals_missing_ei:
+        print(
+            f"[FALLBACK] {sport_up} {date_iso}: all games final, "
+            "but some have no EI yet. Waiting.",
+            flush=True,
+        )
+        return
+
+    # All games final, all EI present, none auto-posted → pick the best game.
+    best_game, best_score, best_raw, _ = max(
+        scored_rows,
+        key=lambda tup: tup[1],
+    )
+    best_id = best_game.get("id")
+    if not best_id:
+        print(
+            f"[FALLBACK] {sport_up} {date_iso}: cannot determine best game id.",
+            flush=True,
+        )
+        return
+
+    if already_posted(ledger, best_id):
+        print(
+            f"[FALLBACK] {sport_up} {date_iso}: top game {best_id} already posted.",
+            flush=True,
+        )
+        return
+
+    print(
+        f"[FALLBACK] {sport_up} {date_iso}: posting top game {best_id}.",
+        flush=True,
+    )
+    fb_block = _format_block(
+        game=best_game,
+        score_val=best_score,
+        excite_raw=best_raw,
+        date_iso=date_iso,
+    )
+    print(fb_block, flush=True)
+    mark_posted(ledger, best_id)
 
 
 # ----------------------------------------------------------------------

@@ -1,6 +1,7 @@
 import requests
 import re
-from typing import Dict, Tuple
+import datetime
+from typing import Dict, Tuple, Optional
 
 # -----------------------------------------------------------
 # HARD-MAPPED TEAM NAME TRANSLATION (ESPN -> INPREDICTABLE)
@@ -85,6 +86,42 @@ def fetch_precap_html(sport: str):
 
 
 # -----------------------------------------------------------
+# PARSE PRECAP HEADER DATE ("For Games Played on ...")
+# -----------------------------------------------------------
+
+# Example header text:
+#   "For Games Played on November 30, 2025"
+_PRECAP_DATE_REGEX = re.compile(
+    r"For Games Played on ([A-Za-z]+)\s+(\d{1,2}),\s+(\d{4})",
+    re.IGNORECASE,
+)
+
+
+def _parse_precap_date_iso(html: str) -> Optional[str]:
+    """
+    Extract the 'For Games Played on Month DD, YYYY' header and return
+    it as 'YYYY-MM-DD'. If not found or invalid, return None.
+    """
+    if not html:
+        return None
+
+    m = _PRECAP_DATE_REGEX.search(html)
+    if not m:
+        return None
+
+    month_name, day_str, year_str = m.groups()
+    try:
+        dt = datetime.datetime.strptime(
+            f"{month_name} {int(day_str)}, {int(year_str)}",
+            "%B %d, %Y",
+        ).date()
+    except Exception:
+        return None
+
+    return dt.isoformat()
+
+
+# -----------------------------------------------------------
 # PARSE FINISHED GAMES FROM PRECAP HTML
 # -----------------------------------------------------------
 
@@ -136,26 +173,47 @@ def parse_precap_finished_games(html: str, sport: str):
 # PUBLIC API USED BY main.py
 # -----------------------------------------------------------
 
-# Simple in-process cache so we don't hammer PreCap on every poll
-_PRECAP_CACHE: Dict[str, Dict[Tuple[str, str], float]] = {}
-
-
-def fetch_excitement_map(sport: str) -> Dict[Tuple[str, str], float]:
+def fetch_excitement_map(
+    sport: str,
+    expected_date_iso: Optional[str] = None,
+) -> Dict[Tuple[str, str], float]:
     """
     Return a mapping {(AWAY_CODE, HOME_CODE): excitement_float} for all
     finished games currently listed on Inpredictable's PreCap page.
 
-    main.py expects this tuple-keyed structure so it can look up values
-    using (away_code, home_code).
+    If expected_date_iso is provided (YYYY-MM-DD), we will:
+      - Parse the header 'For Games Played on Month DD, YYYY'
+      - Convert it to YYYY-MM-DD
+      - If it does NOT match expected_date_iso, we treat PreCap as
+        stale/mismatched and return an EMPTY map.
+
+    This guarantees we never apply yesterday's EI to today's games,
+    even if the same teams play back-to-back in the same arena.
     """
     sport_up = sport.upper()
-    if sport_up in _PRECAP_CACHE:
-        return _PRECAP_CACHE[sport_up]
 
     html, err = fetch_precap_html(sport_up)
     if err:
-        # Let the caller's try/except handle this
         raise RuntimeError(f"PreCap fetch failed for {sport_up}: {err}")
+
+    header_date_iso = _parse_precap_date_iso(html)
+
+    if expected_date_iso is not None:
+        if header_date_iso is None:
+            print(
+                f"[INPRED WARNING] {sport_up}: could not parse PreCap header date; "
+                f"expected {expected_date_iso}. Ignoring EI for safety.",
+                flush=True,
+            )
+            return {}
+
+        if header_date_iso != expected_date_iso:
+            print(
+                f"[INPRED WARNING] {sport_up}: PreCap date {header_date_iso} "
+                f"!= expected {expected_date_iso}. Ignoring EI for safety.",
+                flush=True,
+            )
+            return {}
 
     string_map = parse_precap_finished_games(html, sport_up)
 
@@ -170,14 +228,12 @@ def fetch_excitement_map(sport: str) -> Dict[Tuple[str, str], float]:
             continue
         tuple_map[(away, home)] = excite
 
-    _PRECAP_CACHE[sport_up] = tuple_map
     return tuple_map
 
 
 def get_excitation_for_date(sport: str, date_str: str):
     """
-    Legacy wrapper that returns a dict in the older format used by some
-    other scripts:
+    Legacy wrapper that returns a dict in the older format:
 
       {
         "source": "INPREDICTABLE",
@@ -185,10 +241,11 @@ def get_excitation_for_date(sport: str, date_str: str):
         "error": None or str,
       }
 
-    date_str is unused because PreCap always shows the current day.
+    date_str is used as expected_date_iso so we only return EI when the
+    PreCap header date matches date_str.
     """
     try:
-        tuple_map = fetch_excitement_map(sport)
+        tuple_map = fetch_excitement_map(sport, expected_date_iso=date_str)
     except Exception as e:
         return {
             "source": "INPREDICTABLE",
@@ -196,7 +253,6 @@ def get_excitation_for_date(sport: str, date_str: str):
             "error": str(e),
         }
 
-    # Convert back to "AWAY@HOME" string keys for compatibility
     legacy_map = {f"{a}@{h}": val for (a, h), val in tuple_map.items()}
     return {
         "source": "INPREDICTABLE",
